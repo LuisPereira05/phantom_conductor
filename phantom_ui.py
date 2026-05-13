@@ -1,22 +1,13 @@
 """
-Phantom Conductor — Python UI
-==============================
+Phantom Conductor — UI + Shared State
+======================================
 Dark rack-unit style interface using Dear PyGui.
 
 Install:
-    pip install dearpygui
+    pip install dearpygui mutagen
 
 Run standalone (simulated data):
     python phantom_ui.py
-
-Integration:
-    Import PhantomState and update it from your audio/gesture threads.
-    The UI reads state every frame — no extra wiring needed.
-
-Architecture:
-    PhantomState   — shared state object (thread-safe via threading.Lock)
-    Logger         — ring-buffer log, written from any thread
-    PhantomUI      — Dear PyGui window, reads state + renders every frame
 """
 
 import threading
@@ -24,66 +15,183 @@ import time
 import math
 import random
 import collections
+import os
 import dearpygui.dearpygui as dpg
+
+try:
+    from mutagen.mp3 import MP3
+    from mutagen import File as MutagenFile
+    HAS_MUTAGEN = True
+except ImportError:
+    HAS_MUTAGEN = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SHARED STATE  — update from your audio/gesture/BPM threads
+#  TRACK QUEUE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TrackQueue:
+    """Thread-safe FIFO queue for audio tracks with BPM metadata."""
+
+    def __init__(self):
+        self._lock   = threading.Lock()
+        self._tracks = []           # list of dicts: {path, name, bpm, duration}
+        self._index  = 0            # currently loaded track index (-1 = none)
+
+    def add(self, path: str, bpm: float | None = None, duration: float = 0.0):
+        name = os.path.basename(path)
+        entry = {"path": path, "name": name, "bpm": bpm, "duration": duration}
+        with self._lock:
+            self._tracks.append(entry)
+
+    def remove(self, idx: int):
+        with self._lock:
+            if 0 <= idx < len(self._tracks):
+                removed_before_current = idx < self._index
+                self._tracks.pop(idx)
+                if removed_before_current:
+                    self._index = max(0, self._index - 1)
+                elif self._index >= len(self._tracks):
+                    self._index = max(0, len(self._tracks) - 1)
+
+    def move_up(self, idx: int):
+        with self._lock:
+            if idx > 0 and idx < len(self._tracks):
+                self._tracks[idx-1], self._tracks[idx] = \
+                    self._tracks[idx], self._tracks[idx-1]
+                if self._index == idx:
+                    self._index = idx - 1
+                elif self._index == idx - 1:
+                    self._index = idx
+
+    def move_down(self, idx: int):
+        with self._lock:
+            if idx >= 0 and idx < len(self._tracks) - 1:
+                self._tracks[idx], self._tracks[idx+1] = \
+                    self._tracks[idx+1], self._tracks[idx]
+                if self._index == idx:
+                    self._index = idx + 1
+                elif self._index == idx + 1:
+                    self._index = idx
+
+    def get_current(self) -> dict | None:
+        with self._lock:
+            if self._tracks and 0 <= self._index < len(self._tracks):
+                return self._tracks[self._index].copy()
+            return None
+
+    def next_track(self) -> dict | None:
+        with self._lock:
+            if not self._tracks:
+                return None
+            self._index = (self._index + 1) % len(self._tracks)
+            return self._tracks[self._index].copy()
+
+    def prev_track(self) -> dict | None:
+        with self._lock:
+            if not self._tracks:
+                return None
+            self._index = (self._index - 1) % len(self._tracks)
+            return self._tracks[self._index].copy()
+
+    def select(self, idx: int) -> dict | None:
+        with self._lock:
+            if 0 <= idx < len(self._tracks):
+                self._index = idx
+                return self._tracks[idx].copy()
+            return None
+
+    def snapshot(self) -> tuple[list, int]:
+        with self._lock:
+            return list(self._tracks), self._index
+
+    def __len__(self):
+        with self._lock:
+            return len(self._tracks)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SHARED STATE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PhantomState:
     """
     Thread-safe container for all runtime state.
-    Your worker threads write here; the UI reads here every frame.
-
-    Usage from bpm_analysis_thread():
-        STATE.set_bpm(bpm_new)
-
-    Usage from gesture_vision_thread():
-        STATE.set_gesture("OPEN HAND", confidence=0.94)
-        STATE.set_command("PLAY")
+    All worker threads write here; the UI reads every frame.
     """
+
     def __init__(self):
         self._lock = threading.Lock()
 
         # BPM
-        self.bpm_live: float | None = None
-        self.bpm_original: float    = 120.0
-        self.bpm_raw: float | None  = None
+        self.bpm_live: float | None      = None
+        self.bpm_original: float         = 120.0
+        self.bpm_raw: float | None       = None
         self.bpm_corrected: float | None = None
-        self.stretch_ratio: float   = 1.0
-        self.bpm_source: str        = "audio"   # "audio" | "tap"
+        self.stretch_ratio: float        = 1.0
+        self.bpm_source: str             = "audio"
+        self.onset_max: float            = 0.0
+        self.last_bpm_dbg: dict          = {}
 
         # Playback
-        self.is_playing: bool       = False
-        self.is_looping: bool       = False
-        self.track_path: str        = ""
-        self.track_duration: float  = 0.0
-        self.track_position: float  = 0.0      # seconds elapsed
-        self.markers: list[float]   = []        # list of marker positions in seconds
+        self.is_playing: bool            = False
+        self.is_looping: bool            = False
+        self.track_path: str             = ""
+        self.track_duration: float       = 0.0
+        self.track_position: float       = 0.0
+        self.markers: list[float]        = []
 
-        # Audio level  (0.0–1.0)
-        self.rms: float             = 0.0
-        self.peak: float            = 0.0
-        self.waveform: list[float]  = [0.0] * 64   # last 64 short-window RMS values
+        # Signals to worker threads (set by UI callbacks)
+        self.load_new_track: dict | None = None   # set to track dict → picked up by worker
+        self.skip_to_next: bool          = False
+        self.skip_to_prev: bool          = False
+
+        # Audio level
+        self.rms: float                  = 0.0
+        self.peak: float                 = 0.0
+        self.waveform: list[float]       = [0.0] * 64
+        self.buffer_fill: float          = 0.0
 
         # Gesture
-        self.gesture_name: str      = "NO HAND"
-        self.gesture_confidence: float = 0.0
-        self.gesture_hold_frames: int  = 0
-        self.gesture_hold_target: int  = 8
+        self.gesture_name: str           = "NO HAND"
+        self.gesture_confidence: float   = 0.0
+        self.gesture_hold_frames: int    = 0
+        self.gesture_hold_target: int    = 8
         self.pending_command: str | None = None
         self.last_command: str | None    = None
-        self.hands_detected: int    = 0
-        self.camera_active: bool    = False
+        self.hands_detected: int         = 0
+        self.camera_active: bool         = False
 
         # System
-        self.running: bool          = True
-        self.start_time: float      = time.time()
-        self.onset_max: float       = 0.0
-        self.buffer_fill: float     = 0.0      # 0–1, how full the audio ring buffer is
+        self.running: bool               = True
+        self.start_time: float           = time.time()
 
-    # ── Setters (called from worker threads) ─────────────────────────────────
+        # Track queue (shared object, itself thread-safe)
+        self.queue: TrackQueue           = TrackQueue()
+
+    # ── Playback control ─────────────────────────────────────────────────────
+    def play(self):
+        with self._lock:
+            self.is_playing = True
+
+    def pause(self):
+        with self._lock:
+            self.is_playing = False
+
+    def toggle(self) -> bool:
+        with self._lock:
+            self.is_playing = not self.is_playing
+            return self.is_playing
+
+    def playing(self) -> bool:
+        with self._lock:
+            return self.is_playing
+
+    # ── BPM ──────────────────────────────────────────────────────────────────
+    def get_bpm(self) -> float | None:
+        with self._lock:
+            return self.bpm_live
+
     def set_bpm(self, bpm: float, raw: float | None = None,
                 corrected: float | None = None, onset_max: float = 0.0):
         with self._lock:
@@ -93,6 +201,7 @@ class PhantomState:
             self.stretch_ratio = bpm / self.bpm_original if self.bpm_original else 1.0
             self.onset_max     = onset_max
 
+    # ── Gesture ───────────────────────────────────────────────────────────────
     def set_gesture(self, name: str, confidence: float = 0.0,
                     hold_frames: int = 0, hands: int = 1):
         with self._lock:
@@ -102,27 +211,33 @@ class PhantomState:
             self.hands_detected      = hands
             self.camera_active       = (hands > 0)
 
+    def get_gesture(self) -> str:
+        with self._lock:
+            return self.gesture_name
+
     def set_command(self, cmd: str | None):
         with self._lock:
             self.last_command    = cmd
             self.pending_command = cmd
 
-    def set_playback(self, playing: bool):
+    # ── Audio ─────────────────────────────────────────────────────────────────
+    def push_waveform(self, rms_val: float):
         with self._lock:
-            self.is_playing = playing
+            self.waveform.append(min(1.0, float(rms_val)))
+            if len(self.waveform) > 64:
+                self.waveform.pop(0)
+            self.rms  = float(rms_val)
+            self.peak = max(self.peak * 0.98, float(rms_val))
 
     def set_position(self, pos: float):
         with self._lock:
             self.track_position = pos
 
-    def push_waveform(self, rms_val: float):
+    def set_playback(self, playing: bool):
         with self._lock:
-            self.waveform.append(min(1.0, rms_val))
-            if len(self.waveform) > 64:
-                self.waveform.pop(0)
-            self.rms  = rms_val
-            self.peak = max(self.peak * 0.98, rms_val)
+            self.is_playing = playing
 
+    # ── System ────────────────────────────────────────────────────────────────
     def stop(self):
         with self._lock:
             self.running = False
@@ -131,35 +246,29 @@ class PhantomState:
         with self._lock:
             return self.running
 
-    # ── Snapshot (read from UI thread) ───────────────────────────────────────
     def snapshot(self) -> dict:
         with self._lock:
-            return self.__dict__.copy()
+            d = self.__dict__.copy()
+            d.pop("_lock", None)
+            d.pop("queue", None)
+            return d
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  LOGGER  — ring buffer, written from any thread
+#  LOGGER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Logger:
-    LEVELS = {"info": 0, "ok": 1, "warn": 2, "err": 3}
-    COLORS = {
-        "info": (130, 127, 120, 255),
-        "ok":   (99,  197, 71,  255),
-        "warn": (239, 159, 39,  255),
-        "err":  (226, 75,  74,  255),
-    }
-
     def __init__(self, maxlen: int = 200):
         self._lock  = threading.Lock()
         self._lines = collections.deque(maxlen=maxlen)
         self._start = time.time()
 
     def log(self, msg: str, level: str = "info"):
-        t   = time.time() - self._start
-        m   = int(t // 60)
-        s   = t % 60
-        ts  = f"{m:02d}:{s:05.2f}"
+        t  = time.time() - self._start
+        m  = int(t // 60)
+        s  = t % 60
+        ts = f"{m:02d}:{s:05.2f}"
         with self._lock:
             self._lines.appendleft((ts, level, msg))
 
@@ -182,39 +291,35 @@ class Logger:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 C = {
-    "bg":         (14,  14,  14,  255),
-    "panel":      (22,  22,  22,  255),
-    "panel2":     (28,  28,  28,  255),
-    "border":     (42,  42,  42,  255),
-    "border2":    (55,  55,  55,  255),
-    "text":       (212, 207, 200, 255),
-    "text_dim":   (110, 106, 98,  255),
-    "amber":      (239, 159, 39,  255),
-    "amber_dim":  (186, 117, 23,  255),
-    "amber_faint":(65,  36,  2,   255),
-    "green":      (99,  197, 71,  255),
-    "green_dim":  (59,  109, 17,  255),
-    "red":        (226, 75,  74,  255),
-    "blue":       (55,  138, 221, 255),
-    "blue_dim":   (24,  95,  165, 255),
-    "black":      (0,   0,   0,   255),
-    "white":      (255, 255, 255, 255),
+    "bg":           (14,  14,  14,  255),
+    "panel":        (22,  22,  22,  255),
+    "panel2":       (28,  28,  28,  255),
+    "border":       (42,  42,  42,  255),
+    "border2":      (55,  55,  55,  255),
+    "text":         (212, 207, 200, 255),
+    "text_dim":     (110, 106, 98,  255),
+    "amber":        (239, 159, 39,  255),
+    "amber_dim":    (186, 117, 23,  255),
+    "amber_faint":  (65,  36,  2,   255),
+    "green":        (99,  197, 71,  255),
+    "green_dim":    (59,  109, 17,  255),
+    "red":          (226, 75,  74,  255),
+    "red_faint":    (45,  16,  16,  255),
+    "blue":         (55,  138, 221, 255),
+    "blue_dim":     (24,  95,  165, 255),
+    "black":        (0,   0,   0,   255),
+    "white":        (255, 255, 255, 255),
+    "select":       (35,  55,  90,  255),
 }
 
 GESTURE_ICONS = {
-    "NO HAND":   " — ",
-    "OPEN HAND": "[O]",
-    "FIST":      "[F]",
-    "POINTING":  "[^]",
-    "ROCK":      "[R]",
-    "PEACE":     "[V]",
-    "THUMBS UP": "[T]",
+    "NO HAND":  " — ",
+    "PLAY":     "[O]",
+    "PAUSE":    "[F]",
 }
 GESTURE_COMMANDS = {
-    "OPEN HAND": "PLAY",
-    "FIST":      "PAUSE",
-    "POINTING":  "NEXT",
-    "ROCK":      "LOOP",
+    "PLAY":  "PLAY",
+    "PAUSE": "PAUSE",
 }
 
 
@@ -223,15 +328,16 @@ GESTURE_COMMANDS = {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PhantomUI:
-    WIN_W, WIN_H = 1020, 700
+    WIN_W, WIN_H = 1280, 780
 
     def __init__(self, state: PhantomState, logger: Logger):
-        self.state  = state
-        self.logger = logger
-        self._tick  = 0
-        self._waveform_buf: list[float] = [0.0] * 64
+        self.state   = state
+        self.logger  = logger
+        self._tick   = 0
+        self._queue_sel: int = -1          # selected row in queue table
+        self._last_queue_len: int = -1     # track when queue changes for redraw
 
-    # ── per-item button themes (built once, swapped at runtime) ───────────────
+    # ── themes ────────────────────────────────────────────────────────────────
     def _make_btn_theme(self, text_color, bg_color, border_color):
         with dpg.theme() as t:
             with dpg.theme_component(dpg.mvButton):
@@ -247,16 +353,23 @@ class PhantomUI:
         dpg.create_viewport(
             title="Phantom Conductor",
             width=self.WIN_W, height=self.WIN_H,
-            min_width=900, min_height=600,
+            min_width=1000, min_height=650,
             resizable=True,
         )
         self._apply_theme()
-        # Button state themes — built before UI so we can bind them
-        self._theme_play_idle    = self._make_btn_theme(C["text"],  C["panel2"],      C["border2"])
-        self._theme_play_active  = self._make_btn_theme(C["green"], (21,48,16,255),   C["green_dim"])
-        self._theme_loop_idle    = self._make_btn_theme(C["text"],  C["panel2"],      C["border2"])
-        self._theme_loop_active  = self._make_btn_theme(C["amber"], C["amber_faint"], C["amber_dim"])
+
+        self._theme_play_idle   = self._make_btn_theme(C["text"],  C["panel2"],    C["border2"])
+        self._theme_play_active = self._make_btn_theme(C["green"], (21,48,16,255), C["green_dim"])
+        self._theme_loop_idle   = self._make_btn_theme(C["text"],  C["panel2"],    C["border2"])
+        self._theme_loop_active = self._make_btn_theme(C["amber"], C["amber_faint"], C["amber_dim"])
+        self._theme_amb  = self._make_btn_theme(C["amber"], C["amber_faint"], C["amber_dim"])
+        self._theme_grn  = self._make_btn_theme(C["green"], (21,48,16,255),  C["green_dim"])
+        self._theme_red  = self._make_btn_theme(C["red"],   C["red_faint"],  (100,40,40,255))
+        self._theme_blue = self._make_btn_theme(C["blue"],  (15,30,55,255),  C["blue_dim"])
+        self._theme_dim  = self._make_btn_theme(C["text_dim"], C["panel"], C["border"])
+
         self._build_ui()
+        self._setup_file_dialog()
         dpg.setup_dearpygui()
         dpg.show_viewport()
 
@@ -269,14 +382,15 @@ class PhantomUI:
             self._update_waveform(snap)
             self._update_transport(snap)
             self._update_gesture(snap)
+            self._update_queue_panel()
             self._update_log()
             self._update_clock(snap)
             dpg.render_dearpygui_frame()
         dpg.destroy_context()
 
-    # ── theme ──────────────────────────────────────────────────────────────────
+    # ── global theme ──────────────────────────────────────────────────────────
     def _apply_theme(self):
-        with dpg.theme() as global_theme:
+        with dpg.theme() as g:
             with dpg.theme_component(dpg.mvAll):
                 dpg.add_theme_color(dpg.mvThemeCol_WindowBg,        C["bg"])
                 dpg.add_theme_color(dpg.mvThemeCol_ChildBg,         C["panel"])
@@ -291,8 +405,9 @@ class PhantomUI:
                 dpg.add_theme_color(dpg.mvThemeCol_Button,          C["panel2"])
                 dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered,   C["border2"])
                 dpg.add_theme_color(dpg.mvThemeCol_ButtonActive,    C["border"])
-                dpg.add_theme_color(dpg.mvThemeCol_Header,          C["panel2"])
+                dpg.add_theme_color(dpg.mvThemeCol_Header,          C["select"])
                 dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered,   C["border"])
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive,    C["select"])
                 dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg,     C["bg"])
                 dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrab,   C["border2"])
                 dpg.add_theme_color(dpg.mvThemeCol_PopupBg,         C["panel2"])
@@ -302,41 +417,65 @@ class PhantomUI:
                 dpg.add_theme_style(dpg.mvStyleVar_WindowPadding,   10, 10)
                 dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing,     6, 4)
                 dpg.add_theme_style(dpg.mvStyleVar_FramePadding,    6, 4)
-        dpg.bind_theme(global_theme)
+        dpg.bind_theme(g)
 
-    def _amber_btn_theme(self):
-        with dpg.theme() as t:
-            with dpg.theme_component(dpg.mvButton):
-                dpg.add_theme_color(dpg.mvThemeCol_Button,        C["amber_faint"])
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (80, 45, 5, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Text,          C["amber"])
-                dpg.add_theme_color(dpg.mvThemeCol_Border,        C["amber_dim"])
-        return t
+    # ── file dialog ───────────────────────────────────────────────────────────
+    def _setup_file_dialog(self):
+        with dpg.file_dialog(
+            label="Add Track(s)",
+            tag="file_dlg",
+            width=700, height=500,
+            show=False,
+            callback=self._cb_file_dialog,
+            cancel_callback=lambda s, a, u: None,
+            file_count=100,
+        ):
+            dpg.add_file_extension(".mp3",  color=C["amber"])
+            dpg.add_file_extension(".wav",  color=C["green"])
+            dpg.add_file_extension(".flac", color=C["blue"])
+            dpg.add_file_extension(".ogg",  color=C["text"])
+            dpg.add_file_extension(".*",    color=C["text_dim"])
 
-    def _green_btn_theme(self):
-        with dpg.theme() as t:
-            with dpg.theme_component(dpg.mvButton):
-                dpg.add_theme_color(dpg.mvThemeCol_Button,        (21, 48, 16, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (30, 65, 20, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Text,          C["green"])
-                dpg.add_theme_color(dpg.mvThemeCol_Border,        C["green_dim"])
-        return t
+    def _cb_file_dialog(self, sender, app_data, user_data):
+        selections = app_data.get("selections", {})
+        paths = list(selections.values())
+        if not paths:
+            # single-file path
+            fp = app_data.get("file_path_name", "")
+            if fp:
+                paths = [fp]
+        for path in sorted(paths):
+            if not os.path.isfile(path):
+                continue
+            bpm, dur = self._read_audio_meta(path)
+            self.state.queue.add(path, bpm=bpm, duration=dur)
+            self.logger.ok(f"queue: added {os.path.basename(path)}"
+                           + (f"  BPM={bpm:.1f}" if bpm else ""))
+        self._refresh_queue_table()
 
-    def _red_btn_theme(self):
-        with dpg.theme() as t:
-            with dpg.theme_component(dpg.mvButton):
-                dpg.add_theme_color(dpg.mvThemeCol_Button,        (45, 16, 16, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (65, 22, 22, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Text,          C["red"])
-                dpg.add_theme_color(dpg.mvThemeCol_Border,        (100, 40, 40, 255))
-        return t
+    @staticmethod
+    def _read_audio_meta(path: str) -> tuple[float | None, float]:
+        bpm, dur = None, 0.0
+        if not HAS_MUTAGEN:
+            return bpm, dur
+        try:
+            af = MutagenFile(path)
+            if af:
+                dur = float(af.info.length) if hasattr(af.info, "length") else 0.0
+            tags = af.tags if af else None
+            if tags:
+                for key in ("TBPM", "bpm", "BPM"):
+                    if key in tags:
+                        val = tags[key]
+                        bpm = float(str(val[0] if hasattr(val, "__iter__")
+                                        and not isinstance(val, str) else val))
+                        break
+        except Exception:
+            pass
+        return bpm, dur
 
     # ── UI layout ──────────────────────────────────────────────────────────────
     def _build_ui(self):
-        amb  = self._amber_btn_theme()
-        grn  = self._green_btn_theme()
-        red  = self._red_btn_theme()
-
         with dpg.window(
             label="Phantom Conductor",
             tag="main_win",
@@ -349,10 +488,9 @@ class PhantomUI:
             self._build_header()
             dpg.add_spacer(height=4)
 
-            # ── two-column layout ─────────────────────────────────────────────
             with dpg.group(horizontal=True):
-                # LEFT  (700px wide)
-                with dpg.child_window(width=680, height=-140, border=False, tag="left_col"):
+                # ── LEFT column ───────────────────────────────────────────────
+                with dpg.child_window(width=680, height=-145, border=False, tag="left_col"):
                     self._build_bpm_module()
                     dpg.add_spacer(height=4)
                     self._build_waveform_module()
@@ -363,20 +501,21 @@ class PhantomUI:
 
                 dpg.add_spacer(width=4)
 
-                # RIGHT (gesture + camera status)
-                with dpg.child_window(width=-1, height=-140, border=False, tag="right_col"):
-                    self._build_gesture_module(amb, grn, red)
+                # ── RIGHT column ──────────────────────────────────────────────
+                with dpg.child_window(width=-1, height=-145, border=False, tag="right_col"):
+                    self._build_gesture_module()
+                    dpg.add_spacer(height=4)
+                    self._build_queue_module()
 
-            # BOTTOM — log panel
             dpg.add_spacer(height=4)
-            self._build_log_panel(amb)
+            self._build_log_panel()
 
     # ── header ────────────────────────────────────────────────────────────────
     def _build_header(self):
         with dpg.child_window(height=34, border=True, tag="header_panel"):
             with dpg.group(horizontal=True):
                 dpg.add_text("PHANTOM CONDUCTOR", color=C["amber"])
-                dpg.add_text("  v0.3.0", color=C["text_dim"])
+                dpg.add_text("  v0.4.0", color=C["text_dim"])
                 dpg.add_spacer(width=20)
                 dpg.add_text("●", tag="sys_led", color=C["green"])
                 dpg.add_text("RUNNING", tag="sys_state", color=C["text_dim"])
@@ -389,10 +528,7 @@ class PhantomUI:
             dpg.add_text("BPM DETECTION", color=C["text_dim"])
             dpg.add_spacer(height=2)
             with dpg.group(horizontal=True):
-                # Big BPM number
                 with dpg.group():
-                    dpg.add_text("---", tag="bpm_big", color=C["amber"])
-                    # Make it visually big via draw layer
                     with dpg.drawlist(width=120, height=56, tag="bpm_draw"):
                         dpg.draw_text((0, 0), "---",
                                       tag="bpm_draw_text",
@@ -400,7 +536,6 @@ class PhantomUI:
 
                 dpg.add_spacer(width=16)
 
-                # BPM meta column
                 with dpg.group():
                     dpg.add_text("SOURCE:", color=C["text_dim"])
                     dpg.add_text("audio input", tag="bpm_source", color=C["text"])
@@ -416,7 +551,6 @@ class PhantomUI:
 
                 dpg.add_spacer(width=20)
 
-                # Ratio
                 with dpg.group():
                     dpg.add_text("RATIO", color=C["text_dim"])
                     dpg.add_text("1.000", tag="ratio_val", color=C["amber"])
@@ -425,14 +559,10 @@ class PhantomUI:
                     dpg.add_text("0.000", tag="onset_val", color=C["text_dim"])
 
             dpg.add_spacer(height=4)
-            # Ratio bar (drawn each frame)
             with dpg.drawlist(width=640, height=12, tag="ratio_bar_draw"):
-                # track
                 dpg.draw_rectangle((0, 4), (640, 10), color=C["border"], fill=C["panel2"],
                                    tag="ratio_track")
-                # center line
                 dpg.draw_line((320, 2), (320, 14), color=C["border2"], tag="ratio_center")
-                # fill (updated each frame)
                 dpg.draw_rectangle((320, 4), (320, 10), color=C["amber"], fill=C["amber"],
                                    tag="ratio_fill")
             with dpg.group(horizontal=True):
@@ -442,7 +572,7 @@ class PhantomUI:
                 dpg.add_spacer(width=265)
                 dpg.add_text("2.0×", color=C["text_dim"])
 
-    # ── Waveform / VU module ─────────────────────────────────────────────────
+    # ── Waveform ──────────────────────────────────────────────────────────────
     def _build_waveform_module(self):
         with dpg.child_window(height=80, border=True, tag="wave_panel"):
             dpg.add_text("INPUT LEVEL", color=C["text_dim"])
@@ -458,7 +588,7 @@ class PhantomUI:
                     dpg.add_text("PK:", color=C["text_dim"])
                     dpg.add_text("0.000", tag="peak_val", color=C["amber"])
 
-    # ── Transport module ─────────────────────────────────────────────────────
+    # ── Transport ─────────────────────────────────────────────────────────────
     def _build_transport_module(self):
         with dpg.child_window(height=118, border=True, tag="transport_panel"):
             dpg.add_text("BACKING TRACK", color=C["text_dim"])
@@ -467,7 +597,6 @@ class PhantomUI:
                 dpg.add_spacer(width=10)
                 dpg.add_text("—", tag="file_meta", color=C["text_dim"])
             dpg.add_spacer(height=4)
-            # Timeline
             with dpg.drawlist(width=660, height=20, tag="timeline_draw"):
                 dpg.draw_rectangle((0, 0), (660, 20), color=C["border"], fill=C["panel2"],
                                    tag="tl_bg")
@@ -476,23 +605,30 @@ class PhantomUI:
                 dpg.draw_line((0, 0), (0, 20), color=C["amber"], tag="tl_head")
             dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
-                # Transport buttons
                 dpg.add_button(label=" |<  ", tag="btn_prev",
                                callback=self._cb_prev, width=42)
+                dpg.bind_item_theme("btn_prev", self._theme_dim)
+
                 dpg.add_button(label=" PLAY ", tag="btn_play",
                                callback=self._cb_play, width=70)
+
                 dpg.add_button(label=" >|  ", tag="btn_next",
                                callback=self._cb_next, width=42)
+                dpg.bind_item_theme("btn_next", self._theme_dim)
+
                 dpg.add_spacer(width=6)
                 dpg.add_button(label=" LOOP ", tag="btn_loop",
                                callback=self._cb_loop, width=60)
+
                 dpg.add_spacer(width=6)
                 dpg.add_button(label=" + MARKER ", tag="btn_marker",
                                callback=self._cb_add_marker, width=90)
-                dpg.add_spacer(width=140)
+                dpg.bind_item_theme("btn_marker", self._theme_dim)
+
+                dpg.add_spacer(width=80)
                 dpg.add_text("0:00 / 0:00", tag="time_display", color=C["text_dim"])
 
-    # ── Controls module ───────────────────────────────────────────────────────
+    # ── Controls ──────────────────────────────────────────────────────────────
     def _build_controls_module(self):
         with dpg.child_window(height=90, border=True, tag="controls_panel"):
             dpg.add_text("AUDIO / TIME-STRETCH", color=C["text_dim"])
@@ -527,114 +663,248 @@ class PhantomUI:
                                      min_value=0.0, max_value=1.0, width=120)
 
     # ── Gesture module ────────────────────────────────────────────────────────
-    def _build_gesture_module(self, amb, grn, red):
-        with dpg.child_window(width=-1, height=-1, border=True, tag="gesture_panel"):
+    def _build_gesture_module(self):
+        with dpg.child_window(width=-1, height=260, border=True, tag="gesture_panel"):
             dpg.add_text("GESTURE CONTROL", color=C["text_dim"])
             dpg.add_separator()
             dpg.add_spacer(height=4)
 
-            # Big gesture display box
-            with dpg.drawlist(width=290, height=120, tag="gesture_draw"):
-                dpg.draw_rectangle((0, 0), (290, 120), color=C["border"],
-                                   fill=(10, 10, 10, 255), tag="gest_bg")
-                dpg.draw_text((100, 18), "[  ]", tag="gest_icon_draw",
-                              color=C["text_dim"], size=40)
-                dpg.draw_text((82, 80), "NO HAND", tag="gest_name_draw",
-                              color=C["text_dim"], size=16)
-                dpg.draw_text((170, 104), "—", tag="gest_conf_draw",
-                              color=C["text_dim"], size=12)
-
-            dpg.add_spacer(height=8)
-
-            # Debounce hold bar
-            dpg.add_text("HOLD FRAMES", color=C["text_dim"])
-            dpg.add_progress_bar(tag="hold_bar", default_value=0.0,
-                                 width=-1, height=8,
-                                 overlay="0 / 8")
-            dpg.add_spacer(height=6)
-
-            # Camera status
-            dpg.add_separator()
-            dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
-                dpg.add_text("CAMERA", color=C["text_dim"])
+                # Big gesture box
+                with dpg.drawlist(width=180, height=110, tag="gesture_draw"):
+                    dpg.draw_rectangle((0, 0), (180, 110), color=C["border"],
+                                       fill=(10,10,10,255), tag="gest_bg")
+                    dpg.draw_text((60, 14), "[ ]", tag="gest_icon_draw",
+                                  color=C["text_dim"], size=36)
+                    dpg.draw_text((40, 72), "NO HAND", tag="gest_name_draw",
+                                  color=C["text_dim"], size=14)
+                    dpg.draw_text((130, 96), "—", tag="gest_conf_draw",
+                                  color=C["text_dim"], size=11)
+
                 dpg.add_spacer(width=10)
-                dpg.add_text("●", tag="cam_led", color=C["text_dim"])
-                dpg.add_text("OFFLINE", tag="cam_state", color=C["text_dim"])
-            with dpg.group(horizontal=True):
-                dpg.add_text("HANDS:", color=C["text_dim"])
-                dpg.add_text("0", tag="cam_hands", color=C["text"])
-            with dpg.group(horizontal=True):
-                dpg.add_text("PENDING:", color=C["text_dim"])
-                dpg.add_text("—", tag="cam_pending", color=C["text"])
-            with dpg.group(horizontal=True):
-                dpg.add_text("LAST CMD:", color=C["text_dim"])
-                dpg.add_text("—", tag="cam_lastcmd", color=C["text"])
 
-            dpg.add_spacer(height=8)
+                with dpg.group():
+                    dpg.add_text("HOLD", color=C["text_dim"])
+                    dpg.add_progress_bar(tag="hold_bar", default_value=0.0,
+                                         width=120, height=8, overlay="0 / 8")
+                    dpg.add_spacer(height=6)
+                    dpg.add_separator()
+                    dpg.add_spacer(height=4)
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("CAM:", color=C["text_dim"])
+                        dpg.add_text("●", tag="cam_led", color=C["text_dim"])
+                        dpg.add_text("OFFLINE", tag="cam_state", color=C["text_dim"])
+                    dpg.add_text("HANDS: 0",   tag="cam_hands",   color=C["text"])
+                    dpg.add_text("CMD:   —",   tag="cam_lastcmd", color=C["text"])
+                    dpg.add_spacer(height=4)
+                    dpg.add_text("🖐 Open = PLAY", color=C["green"])
+                    dpg.add_text("✊ Fist  = PAUSE", color=C["blue"])
+                    dpg.add_spacer(height=4)
+                    dpg.add_button(label=" CLEAR CMD ", tag="btn_clear_cmd",
+                                   callback=lambda: self.state.set_command(None), width=120)
+                    dpg.bind_item_theme("btn_clear_cmd", self._theme_red)
+
+    # ── Queue module ──────────────────────────────────────────────────────────
+    def _build_queue_module(self):
+        with dpg.child_window(width=-1, height=-1, border=True, tag="queue_panel"):
+            dpg.add_text("TRACK QUEUE", color=C["text_dim"])
             dpg.add_separator()
             dpg.add_spacer(height=4)
-            dpg.add_text("GESTURE MAP", color=C["text_dim"])
 
-            rows = [
-                ("[O] Open Hand", "PLAY",  C["green"]),
-                ("[F] Fist",      "PAUSE", C["blue"]),
-                ("[^] Pointing",  "NEXT",  C["text_dim"]),
-                ("[R] Rock",      "LOOP",  C["amber"]),
-                ("[V] Peace",     "PREV",  C["text_dim"]),
-            ]
-            for icon_label, cmd, color in rows:
-                with dpg.group(horizontal=True):
-                    dpg.add_text(icon_label, color=C["text"])
-                    dpg.add_spacer(width=6)
-                    dpg.add_text(f"→ {cmd}", color=color)
+            # toolbar
+            with dpg.group(horizontal=True):
+                dpg.add_button(label=" + ADD ", tag="btn_add",
+                               callback=lambda: dpg.show_item("file_dlg"), width=60)
+                dpg.bind_item_theme("btn_add", self._theme_grn)
 
-            dpg.add_spacer(height=6)
-            dpg.add_button(label="   CLEAR COMMAND   ", tag="btn_clear_cmd",
-                           callback=lambda: self.state.set_command(None), width=-1)
-            dpg.bind_item_theme("btn_clear_cmd", red)
+                dpg.add_button(label=" ▲ ", tag="btn_q_up",
+                               callback=self._cb_q_up, width=36)
+                dpg.bind_item_theme("btn_q_up", self._theme_dim)
+
+                dpg.add_button(label=" ▼ ", tag="btn_q_down",
+                               callback=self._cb_q_down, width=36)
+                dpg.bind_item_theme("btn_q_down", self._theme_dim)
+
+                dpg.add_button(label=" ▶ LOAD ", tag="btn_q_load",
+                               callback=self._cb_q_load, width=72)
+                dpg.bind_item_theme("btn_q_load", self._theme_amb)
+
+                dpg.add_button(label=" ✕ REM ", tag="btn_q_rem",
+                               callback=self._cb_q_remove, width=60)
+                dpg.bind_item_theme("btn_q_rem", self._theme_red)
+
+                dpg.add_button(label=" CLEAR ALL ", tag="btn_q_clear",
+                               callback=self._cb_q_clear, width=80)
+                dpg.bind_item_theme("btn_q_clear", self._theme_red)
+
+            dpg.add_spacer(height=4)
+
+            # Table header (static)
+            with dpg.group(horizontal=True, tag="queue_header"):
+                dpg.add_text("#",       color=C["text_dim"], indent=4)
+                dpg.add_spacer(width=14)
+                dpg.add_text("FILE",    color=C["text_dim"])
+                dpg.add_spacer(width=130)
+                dpg.add_text("BPM",     color=C["text_dim"])
+                dpg.add_spacer(width=30)
+                dpg.add_text("DURATION",color=C["text_dim"])
+            dpg.add_separator()
+
+            # Scrollable list area
+            with dpg.child_window(tag="queue_list", height=-1, border=False,
+                                  horizontal_scrollbar=False):
+                dpg.add_text("— empty —", tag="queue_empty_label",
+                             color=C["text_dim"])
 
     # ── Log panel ─────────────────────────────────────────────────────────────
-    def _build_log_panel(self, amb):
-        with dpg.child_window(height=130, border=True, tag="log_panel"):
+    def _build_log_panel(self):
+        with dpg.child_window(height=135, border=True, tag="log_panel"):
             with dpg.group(horizontal=True):
                 dpg.add_text("SYSTEM LOG", color=C["text_dim"])
                 dpg.add_spacer(width=20)
                 dpg.add_button(label=" CLR ", callback=lambda: self.logger.clear(),
                                tag="btn_clr_log", width=50)
-                dpg.bind_item_theme("btn_clr_log", amb)
+                dpg.bind_item_theme("btn_clr_log", self._theme_amb)
             dpg.add_separator()
-            with dpg.child_window(tag="log_scroll", height=-1, border=False,
-                                  horizontal_scrollbar=False):
-                dpg.add_text("", tag="log_text",
-                             color=C["text_dim"], wrap=990)
+            with dpg.child_window(tag="log_scroll", height=-1, border=False):
+                dpg.add_text("", tag="log_text", color=C["text_dim"], wrap=1200)
 
-    # ── Callbacks ─────────────────────────────────────────────────────────────
+    # ── Queue callbacks ───────────────────────────────────────────────────────
+    def _cb_q_up(self):
+        if self._queue_sel >= 0:
+            self.state.queue.move_up(self._queue_sel)
+            self._queue_sel = max(0, self._queue_sel - 1)
+            self._refresh_queue_table()
+
+    def _cb_q_down(self):
+        tracks, _ = self.state.queue.snapshot()
+        if self._queue_sel >= 0 and self._queue_sel < len(tracks) - 1:
+            self.state.queue.move_down(self._queue_sel)
+            self._queue_sel += 1
+            self._refresh_queue_table()
+
+    def _cb_q_remove(self):
+        if self._queue_sel >= 0:
+            tracks, _ = self.state.queue.snapshot()
+            if self._queue_sel < len(tracks):
+                name = tracks[self._queue_sel]["name"]
+                self.state.queue.remove(self._queue_sel)
+                tracks2, _ = self.state.queue.snapshot()
+                self._queue_sel = min(self._queue_sel, len(tracks2) - 1)
+                self.logger.info(f"queue: removed {name}")
+                self._refresh_queue_table()
+
+    def _cb_q_clear(self):
+        q = self.state.queue
+        with q._lock:
+            q._tracks.clear()
+            q._index = 0
+        self._queue_sel = -1
+        self.logger.info("queue: cleared")
+        self._refresh_queue_table()
+
+    def _cb_q_load(self):
+        """Load the selected track immediately."""
+        if self._queue_sel < 0:
+            return
+        track = self.state.queue.select(self._queue_sel)
+        if track:
+            with self.state._lock:
+                self.state.load_new_track = track
+            self.logger.ok(f"queue: loading → {track['name']}")
+
+    def _cb_q_row(self, sender, app_data, user_data):
+        """Called when a selectable row is clicked."""
+        self._queue_sel = user_data
+        self._refresh_queue_table()
+
+    def _cb_q_row_dbl(self, sender, app_data, user_data):
+        """Double-click a row to load it."""
+        self._queue_sel = user_data
+        self._cb_q_load()
+
+    def _refresh_queue_table(self):
+        """Rebuild the queue list widget from current queue state."""
+        tracks, current_idx = self.state.queue.snapshot()
+
+        # Delete all existing rows
+        try:
+            children = dpg.get_item_children("queue_list", slot=1)
+            if children:
+                for ch in children:
+                    dpg.delete_item(ch)
+        except Exception:
+            pass
+
+        if not tracks:
+            dpg.add_text("— empty —", tag="queue_empty_label",
+                         color=C["text_dim"], parent="queue_list")
+            return
+
+        for i, t in enumerate(tracks):
+            is_current  = (i == current_idx)
+            is_selected = (i == self._queue_sel)
+            name        = t["name"]
+            bpm_str     = f"{t['bpm']:.0f}" if t.get("bpm") else "—"
+            dur         = t.get("duration", 0.0)
+            dur_str     = f"{int(dur)//60}:{int(dur)%60:02d}" if dur else "—"
+
+            row_color   = (C["amber"]  if is_current
+                           else C["text"] if is_selected
+                           else C["text_dim"])
+            prefix      = "▶ " if is_current else f"{i+1:>2}."
+
+            with dpg.group(horizontal=True, parent="queue_list",
+                           tag=f"qrow_{i}"):
+                sel = dpg.add_selectable(
+                    label=f"{prefix}  {name:<40}  {bpm_str:<7}  {dur_str}",
+                    tag=f"qsel_{i}",
+                    default_value=is_selected,
+                    callback=self._cb_q_row,
+                    user_data=i,
+                    width=-1,
+                )
+                dpg.configure_item(f"qsel_{i}", span_columns=True)
+                # Color the text
+                with dpg.theme() as row_theme:
+                    with dpg.theme_component(dpg.mvSelectable):
+                        dpg.add_theme_color(dpg.mvThemeCol_Text, row_color)
+                        if is_selected:
+                            dpg.add_theme_color(dpg.mvThemeCol_Header, C["select"])
+                dpg.bind_item_theme(f"qsel_{i}", row_theme)
+
+    # ── Transport callbacks ───────────────────────────────────────────────────
     def _cb_play(self):
-        snap = self.state.snapshot()
-        new_state = not snap["is_playing"]
-        self.state.set_playback(new_state)
-        self.logger.log(f"transport: {'PLAY' if new_state else 'PAUSE'}", "ok" if new_state else "warn")
+        new_state = self.state.toggle()
+        self.logger.log(f"transport: {'PLAY' if new_state else 'PAUSE'}",
+                        "ok" if new_state else "warn")
 
     def _cb_prev(self):
-        self.state.set_command("PREV")
-        self.logger.log("transport: previous marker", "info")
+        track = self.state.queue.prev_track()
+        if track:
+            with self.state._lock:
+                self.state.load_new_track = track
+            self.logger.info(f"transport: prev → {track['name']}")
 
     def _cb_next(self):
-        self.state.set_command("NEXT")
-        self.logger.log("transport: next marker", "info")
+        track = self.state.queue.next_track()
+        if track:
+            with self.state._lock:
+                self.state.load_new_track = track
+            self.logger.info(f"transport: next → {track['name']}")
 
     def _cb_loop(self):
         with self.state._lock:
             self.state.is_looping = not self.state.is_looping
             looping = self.state.is_looping
-        self.logger.log(f"loop: {'ON' if looping else 'OFF'}", "ok" if looping else "info")
+        self.logger.log(f"loop: {'ON' if looping else 'OFF'}",
+                        "ok" if looping else "info")
 
     def _cb_add_marker(self):
         with self.state._lock:
             pos = self.state.track_position
             self.state.markers.append(pos)
-        self.logger.log(f"marker added at {pos:.2f}s", "info")
+        self.logger.info(f"marker added at {pos:.2f}s")
 
     # ── Frame updates ─────────────────────────────────────────────────────────
     def _update_clock(self, snap: dict):
@@ -645,16 +915,15 @@ class PhantomUI:
         dpg.set_value("sys_clock", f"{h:02d}:{m:02d}:{s:02d}")
 
     def _update_bpm(self, snap: dict):
-        bpm = snap["bpm_live"]
-        orig = snap["bpm_original"]
+        bpm   = snap["bpm_live"]
+        orig  = snap["bpm_original"]
         ratio = snap["stretch_ratio"]
         onset = snap["onset_max"]
         raw   = snap["bpm_raw"]
         corr  = snap["bpm_corrected"]
 
-        # BPM draw text
-        bpm_str = f"{bpm:.1f}" if bpm else "---"
-        synced  = bpm and abs(ratio - 1.0) < 0.03
+        bpm_str   = f"{bpm:.1f}" if bpm else "---"
+        synced    = bpm and abs(ratio - 1.0) < 0.03
         bpm_color = C["green"] if synced else C["amber"]
         try:
             dpg.delete_item("bpm_draw_text")
@@ -663,106 +932,106 @@ class PhantomUI:
         except Exception:
             pass
 
-        # metadata
-        dpg.set_value("bpm_source",  snap["bpm_source"])
-        dpg.set_value("ratio_val",   f"{ratio:.3f}")
-        dpg.set_value("onset_val",   f"{onset:.3f}")
+        dpg.set_value("bpm_source",    snap["bpm_source"])
+        dpg.set_value("ratio_val",     f"{ratio:.3f}")
+        dpg.set_value("onset_val",     f"{onset:.3f}")
         dpg.set_value("ctrl_orig_bpm", f"{orig:.1f}")
-        dpg.set_value("ctrl_buf",    f"{int(snap['buffer_fill']*100)}%")
+        dpg.set_value("ctrl_buf",      f"{int(snap['buffer_fill']*100)}%")
         if raw and corr:
             dpg.set_value("bpm_debug", f"raw: {raw:.1f}  corr: {corr:.1f}")
 
-        dpg.configure_item("pill_sync", color=C["green"] if synced else C["text_dim"])
+        dpg.configure_item("pill_sync",
+                           color=C["green"] if synced else C["text_dim"])
 
-        # Ratio bar (ratio maps 0.5–2.0 → 0–640)
+        # ratio bar
         def ratio_to_x(r):
-            # log2 scale centered at 1.0: range [−1, 1] maps to [0, 640]
             v = max(0.5, min(2.0, r))
-            return 320 + (math.log2(v) * 320)   # log2(0.5)=−1, log2(2)=1
+            return 320 + (math.log2(v) * 320)
 
         x = ratio_to_x(ratio)
-        fill_color = C["green"] if synced else (C["amber"] if ratio >= 1.0 else C["blue_dim"])
+        fill_color = (C["green"] if synced
+                      else C["amber"] if ratio >= 1.0
+                      else C["blue_dim"])
         try:
             dpg.delete_item("ratio_fill")
             if ratio >= 1.0:
-                dpg.draw_rectangle((320, 4), (x, 10), color=fill_color, fill=fill_color,
+                dpg.draw_rectangle((320, 4), (x, 10),
+                                   color=fill_color, fill=fill_color,
                                    parent="ratio_bar_draw", tag="ratio_fill")
             else:
-                dpg.draw_rectangle((x, 4), (320, 10), color=fill_color, fill=fill_color,
+                dpg.draw_rectangle((x, 4), (320, 10),
+                                   color=fill_color, fill=fill_color,
                                    parent="ratio_bar_draw", tag="ratio_fill")
         except Exception:
             pass
 
     def _update_waveform(self, snap: dict):
-        wave  = snap["waveform"][-64:]
-        rms   = snap["rms"]
-        peak  = snap["peak"]
+        wave = snap["waveform"][-64:]
+        rms  = snap["rms"]
+        peak = snap["peak"]
         dpg.set_value("rms_val",  f"{rms:.3f}")
         dpg.set_value("peak_val", f"{peak:.3f}")
-
         dpg.configure_item("rms_val",  color=C["green"] if rms > 0.01 else C["text_dim"])
         dpg.configure_item("peak_val", color=C["red"]   if peak > 0.9  else C["amber"])
-        # redraw waveform
+
         try:
             dpg.delete_item("wave_bars", children_only=True)
             dpg.delete_item("wave_bars")
         except Exception:
             pass
         try:
-            w_total = 580
-            bar_w   = w_total // len(wave)
-            mid     = 25
+            bar_w = 580 // max(1, len(wave))
+            mid   = 25
             with dpg.draw_node(parent="waveform_draw", tag="wave_bars"):
                 for i, v in enumerate(wave):
                     h = max(1, int(v * 48))
                     x = i * bar_w
-                    shade = C["amber"] if v > 0.7 else (C["amber_dim"] if v > 0.3 else C["amber_faint"])
-                    dpg.draw_rectangle((x, mid - h//2), (x + max(1, bar_w-1), mid + h//2),
-                                       color=shade, fill=shade)
+                    shade = (C["amber"] if v > 0.7
+                             else C["amber_dim"] if v > 0.3
+                             else C["amber_faint"])
+                    dpg.draw_rectangle(
+                        (x, mid - h//2),
+                        (x + max(1, bar_w-1), mid + h//2),
+                        color=shade, fill=shade)
         except Exception:
             pass
 
     def _update_transport(self, snap: dict):
-        playing  = snap["is_playing"]
-        looping  = snap["is_looping"]
-        pos      = snap["track_position"]
-        dur      = snap["track_duration"]
-        fname    = snap["track_path"]
+        playing = snap["is_playing"]
+        looping = snap["is_looping"]
+        pos     = snap["track_position"]
+        dur     = snap["track_duration"]
+        fname   = snap["track_path"]
 
-        # play button label + theme swap
         dpg.configure_item("btn_play", label=" PAUSE " if playing else " PLAY  ")
         dpg.bind_item_theme("btn_play",
                             self._theme_play_active if playing else self._theme_play_idle)
-
-        # loop button theme swap
         dpg.bind_item_theme("btn_loop",
                             self._theme_loop_active if looping else self._theme_loop_idle)
 
-        # file info
         if fname:
-            name = fname.split("/")[-1].split("\\")[-1]
+            name = os.path.basename(fname)
             dpg.set_value("file_name", name)
+            bpm_orig = snap["bpm_original"]
             dpg.set_value("file_meta",
-                          f"BPM: {snap['bpm_original']:.0f}  ·  {self._fmt_time(dur)}")
+                          f"BPM: {bpm_orig:.0f}  ·  {self._fmt_time(dur)}")
 
-        # time display
         dpg.set_value("time_display",
                       f"{self._fmt_time(pos)} / {self._fmt_time(dur)}")
 
-        # timeline
         progress = (pos / dur) if dur > 0 else 0.0
         x = int(progress * 660)
         try:
             dpg.delete_item("tl_fill")
             dpg.delete_item("tl_head")
-            dpg.draw_rectangle((0, 0), (x, 20), color=C["amber_dim"], fill=C["amber_faint"],
+            dpg.draw_rectangle((0, 0), (x, 20),
+                               color=C["amber_dim"], fill=C["amber_faint"],
                                parent="timeline_draw", tag="tl_fill")
             dpg.draw_line((x, 0), (x, 20), color=C["amber"],
                           parent="timeline_draw", tag="tl_head")
         except Exception:
             pass
 
-        # draw markers
         try:
             dpg.delete_item("tl_markers", children_only=True)
             dpg.delete_item("tl_markers")
@@ -771,81 +1040,75 @@ class PhantomUI:
         if dur > 0:
             try:
                 with dpg.draw_node(parent="timeline_draw", tag="tl_markers"):
-                    for m in snap["markers"]:
+                    for m in snap.get("markers", []):
                         mx = int((m / dur) * 660)
-                        dpg.draw_line((mx, 0), (mx, 20), color=C["blue"], thickness=2)
+                        dpg.draw_line((mx, 0), (mx, 20),
+                                      color=C["blue"], thickness=2)
             except Exception:
                 pass
 
     def _update_gesture(self, snap: dict):
-        name   = snap["gesture_name"]
-        conf   = snap["gesture_confidence"]
-        hold   = snap["gesture_hold_frames"]
-        target = snap["gesture_hold_target"]
-        hands  = snap["hands_detected"]
-        active = snap["camera_active"]
-        cmd    = snap["last_command"]
-        pending = snap["pending_command"]
+        name    = snap["gesture_name"]
+        conf    = snap["gesture_confidence"]
+        hold    = snap["gesture_hold_frames"]
+        target  = snap["gesture_hold_target"]
+        hands   = snap["hands_detected"]
+        active  = snap["camera_active"]
+        cmd     = snap["last_command"]
 
         icon_str = GESTURE_ICONS.get(name, "[ ]")
-        cmd_for_gesture = GESTURE_COMMANDS.get(name)
-        g_color = (C["green"] if cmd_for_gesture == "PLAY"
-                   else C["blue"] if cmd_for_gesture == "PAUSE"
-                   else C["amber"] if cmd_for_gesture in ("LOOP",)
-                   else C["text_dim"])
+        g_color  = (C["green"] if name == "PLAY"
+                    else C["blue"] if name == "PAUSE"
+                    else C["text_dim"])
 
         try:
             dpg.delete_item("gest_icon_draw")
             dpg.delete_item("gest_name_draw")
             dpg.delete_item("gest_conf_draw")
-            dpg.draw_text((90, 14), icon_str, parent="gesture_draw",
-                          tag="gest_icon_draw", color=g_color, size=40)
-            dpg.draw_text((max(4, 145 - len(name)*5), 78), name,
-                          parent="gesture_draw",
-                          tag="gest_name_draw", color=g_color, size=16)
+            dpg.draw_text((48, 12), icon_str, parent="gesture_draw",
+                          tag="gest_icon_draw", color=g_color, size=36)
+            name_x = max(4, 90 - len(name) * 4)
+            dpg.draw_text((name_x, 72), name, parent="gesture_draw",
+                          tag="gest_name_draw", color=g_color, size=13)
             conf_str = f"{conf:.0%}" if active else "—"
-            dpg.draw_text((200, 104), conf_str, parent="gesture_draw",
-                          tag="gest_conf_draw", color=C["text_dim"], size=12)
+            dpg.draw_text((130, 96), conf_str, parent="gesture_draw",
+                          tag="gest_conf_draw", color=C["text_dim"], size=11)
         except Exception:
             pass
 
-        # hold bar
-        hold_frac = min(1.0, hold / max(1, target))
-        dpg.set_value("hold_bar", hold_frac)
+        dpg.set_value("hold_bar", min(1.0, hold / max(1, target)))
         dpg.configure_item("hold_bar", overlay=f"{hold} / {target}")
 
-        # camera status
-        dpg.set_value("cam_led",     "●")
+        dpg.set_value("cam_led", "●")
         dpg.configure_item("cam_led",
                            color=C["green"] if active else C["text_dim"])
         dpg.set_value("cam_state",
                       "ACTIVE" if active else "WAITING")
         dpg.configure_item("cam_state",
                            color=C["green"] if active else C["text_dim"])
-        dpg.set_value("cam_hands",   str(hands))
-        dpg.set_value("cam_pending", str(pending) if pending else "—")
-        dpg.configure_item("cam_pending",
-                           color=C["amber"] if pending else C["text_dim"])
-        dpg.set_value("cam_lastcmd", str(cmd) if cmd else "—")
+        dpg.set_value("cam_hands",
+                      f"HANDS: {hands}")
+        dpg.set_value("cam_lastcmd",
+                      f"CMD:   {cmd}" if cmd else "CMD:   —")
         dpg.configure_item("cam_lastcmd",
-                           color=C["green"] if cmd else C["text_dim"])
+                           color=C["green"] if cmd else C["text"])
+
+    def _update_queue_panel(self):
+        """Redraw queue table only when length changes (cheap check)."""
+        tracks, _ = self.state.queue.snapshot()
+        if len(tracks) != self._last_queue_len:
+            self._last_queue_len = len(tracks)
+            self._refresh_queue_table()
 
     def _update_log(self):
         if self._tick % 6 != 0:
             return
-        lines = self.logger.lines(60)
+        lines = self.logger.lines(80)
         parts = []
         for ts, level, msg in lines:
-            color_name = {
-                "info": "DIM",
-                "ok":   "GRN",
-                "warn": "AMB",
-                "err":  "RED",
-            }.get(level, "DIM")
             parts.append(f"[{ts}] [{level.upper():4s}] {msg}")
         dpg.set_value("log_text", "\n".join(parts))
 
-    # ── helpers ───────────────────────────────────────────────────────────────
     @staticmethod
     def _fmt_time(s: float) -> str:
         s = int(s)
@@ -853,120 +1116,99 @@ class PhantomUI:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DEMO / SIMULATION  (remove or replace with real threads)
+#  STANDALONE DEMO
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _sim_thread(state: PhantomState, logger: Logger):
-    """Simulates BPM detection, audio levels, and gestures for standalone demo."""
     logger.ok("phantom conductor initialized")
-    logger.info("audio device: default input  SR=48000")
-    logger.ok("backing track: demo_120bpm.mp3")
-    logger.info("original BPM: 120.0")
-    logger.ok("mediapipe model: hand_landmarker.task loaded")
-    logger.ok("bpm_analysis_thread started")
-    logger.ok("gesture_vision_thread started")
-    logger.info("waiting for audio signal...")
+    logger.info("standalone demo mode — no real audio")
+    logger.ok("add tracks via the queue panel (+ADD button)")
 
-    state.track_path     = "/tracks/demo_120bpm.mp3"
-    state.track_duration = 243.0
-    state.bpm_original   = 120.0
-    state.markers        = [44.0, 110.0, 175.0]
+    state.bpm_original = 120.0
+    state.track_duration = 0.0
 
-    gestures = [
-        "NO HAND", "NO HAND", "NO HAND",
-        "OPEN HAND", "OPEN HAND", "OPEN HAND",
-        "NO HAND",
-        "FIST", "FIST",
-        "NO HAND",
-        "POINTING",
-        "NO HAND",
-        "ROCK",
-        "NO HAND",
-    ]
-    g_idx = 0
-
-    bpm_target = 128.0
-    bpm_cur    = 120.0
-    hold       = 0
-    tick       = 0
+    gestures = ["NO HAND","NO HAND","PLAY","PLAY","PLAY","NO HAND",
+                "PAUSE","PAUSE","NO HAND"]
+    g_idx  = 0
+    hold   = 0
+    tick   = 0
+    bpm_cur = 120.0
+    bpm_target = 120.0
 
     while state.alive():
         tick += 1
 
-        # ── BPM simulation ────────────────────────────────────────────────────
-        bpm_target += random.gauss(0, 0.3)
+        # Check for newly loaded track
+        with state._lock:
+            new_track = state.load_new_track
+            if new_track:
+                state.load_new_track = None
+                state.track_path     = new_track["path"]
+                state.track_duration = new_track.get("duration", 0.0)
+                state.track_position = 0.0
+                bpm_orig = new_track.get("bpm") or 120.0
+                state.bpm_original   = bpm_orig
+                state.bpm_live       = bpm_orig
+                state.stretch_ratio  = 1.0
+                logger.ok(f"loaded: {new_track['name']}")
+
+        # BPM simulation
+        bpm_target += random.gauss(0, 0.2)
         bpm_target  = max(100.0, min(160.0, bpm_target))
-        bpm_cur     = bpm_cur * 0.92 + bpm_target * 0.08
-        raw         = bpm_cur + random.gauss(0, 1.5)
-        onset       = 0.15 + random.random() * 0.65
-        state.set_bpm(bpm_cur, raw=raw, corrected=bpm_cur, onset_max=onset)
+        bpm_cur     = bpm_cur * 0.95 + bpm_target * 0.05
+        onset       = 0.1 + random.random() * 0.7
+        state.set_bpm(bpm_cur,
+                      raw=bpm_cur + random.gauss(0,1.2),
+                      corrected=bpm_cur,
+                      onset_max=onset)
 
-        if tick % 20 == 0:
-            logger.info(
-                f"bpm: live={bpm_cur:.1f}  raw={raw:.1f}  "
-                f"ratio={bpm_cur/state.bpm_original:.3f}  onset={onset:.3f}"
-            )
+        # Fake audio level when playing
+        if state.playing():
+            rms = 0.08 + random.random() * 0.4
+            state.push_waveform(rms)
+            with state._lock:
+                state.buffer_fill = min(1.0, tick / 120)
+                dur = state.track_duration
+                if dur > 0:
+                    state.track_position = min(dur, state.track_position + 0.1)
+                    if state.track_position >= dur:
+                        if state.is_looping:
+                            state.track_position = 0.0
+                        else:
+                            state.is_playing = False
+                            logger.ok("track finished")
+        else:
+            state.push_waveform(0.0)
 
-        # ── Audio level simulation ────────────────────────────────────────────
-        rms = 0.05 + random.random() * (0.55 if state.is_playing else 0.12)
-        state.push_waveform(rms)
-        state.buffer_fill = min(1.0, tick / 240)
-
-        # ── Playback position ─────────────────────────────────────────────────
-        if state.is_playing:
-            state.track_position = min(
-                state.track_duration,
-                state.track_position + 0.1
-            )
-            if state.track_position >= state.track_duration:
-                if state.is_looping:
-                    state.track_position = 0.0
-                    logger.info("loop: restarted")
-                else:
-                    state.is_playing = False
-                    logger.ok("track finished")
-
-        # ── Gesture simulation ────────────────────────────────────────────────
-        if tick % 15 == 0:
+        # Gesture simulation
+        if tick % 18 == 0:
             g_name = gestures[g_idx % len(gestures)]
             g_idx += 1
             active = g_name != "NO HAND"
             hold   = min(hold + 1, 12) if active else 0
-            conf   = 0.70 + random.random() * 0.28 if active else 0.0
+            conf   = 0.72 + random.random() * 0.26 if active else 0.0
             state.set_gesture(g_name, confidence=conf,
                               hold_frames=hold, hands=1 if active else 0)
-
             if active and hold == 8:
-                cmd = GESTURE_COMMANDS.get(g_name)
-                if cmd:
-                    state.set_command(cmd)
-                    logger.ok(f"gesture: {g_name} → {cmd}")
-                    if cmd == "PLAY":
-                        state.set_playback(True)
-                    elif cmd == "PAUSE":
-                        state.set_playback(False)
-                    elif cmd == "LOOP":
-                        state.is_looping = not state.is_looping
-                        logger.ok(f"loop: {'ON' if state.is_looping else 'OFF'}")
-            elif active:
-                logger.info(f"gesture: {g_name}  hold={hold}/8  conf={conf:.2f}")
+                if g_name == "PLAY":
+                    state.play()
+                    state.set_command("PLAY")
+                    logger.ok("gesture: PLAY confirmed")
+                elif g_name == "PAUSE":
+                    state.pause()
+                    state.set_command("PAUSE")
+                    logger.ok("gesture: PAUSE confirmed")
 
         time.sleep(0.1)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     state  = PhantomState()
     logger = Logger()
 
-    # ── Start the simulation thread (replace with your real threads) ──────────
     sim = threading.Thread(target=_sim_thread, args=(state, logger), daemon=True)
     sim.start()
 
-    # ── Run UI (blocking, must be on main thread) ─────────────────────────────
     ui = PhantomUI(state, logger)
     try:
         ui.run()
