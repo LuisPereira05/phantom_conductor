@@ -37,7 +37,7 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
-
+from phantom_ui import PhantomState, Logger, PhantomUI
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONFIG GLOBAL
@@ -136,10 +136,10 @@ class SharedState:
             return self.last_gesture
 
 
-STATE = SharedState()
+STATE = PhantomState()
 audio_buffer = deque(maxlen=int(SR * BUFFER_SEC))
 audio_queue  = Queue(maxsize=40)
-
+LOG = Logger()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UTILS — MODELO
@@ -382,10 +382,10 @@ def draw_hud(frame, gesture_raw, fps):
     F  = cv2.FONT_HERSHEY_DUPLEX
     FS = cv2.FONT_HERSHEY_SIMPLEX
 
-    playing    = STATE.playing()
-    bpm_live   = STATE.get_bpm()
-    bpm_orig   = STATE.bpm_original
-    dbg        = STATE.last_bpm_dbg
+    playing  = STATE.playing()
+    bpm_live = STATE.get_bpm()
+    bpm_orig = STATE.bpm_original
+    dbg      = STATE.last_bpm_dbg
 
     # ── Barra superior ───────────────────────────────────────────────────────
     draw_rect_alpha(frame, 0, 0, w, 52, (10,10,10))
@@ -398,38 +398,44 @@ def draw_hud(frame, gesture_raw, fps):
     px, py = 12, h - 160
     draw_rect_alpha(frame, px, py, px+340, py+145, (10,10,10))
 
-    # Status PLAY / PAUSE
-    state_str  = "▶  PLAY" if playing else "⏸  PAUSE"
-    state_col  = PLAY_COLOR if playing else PAUSE_COLOR
-    # Barra lateral colorida
+    state_str = "▶  PLAY" if playing else "⏸  PAUSE"
+    state_col = PLAY_COLOR if playing else PAUSE_COLOR
     cv2.rectangle(frame, (px, py), (px+6, py+145), state_col, -1)
     shadow_text(frame, state_str, (px+16, py+40), F, 1.1, state_col, 2)
 
     # BPM
     if bpm_live:
-        ratio = bpm_live / bpm_orig if bpm_orig else 1.0
-        bpm_str = f"BPM live: {bpm_live:.1f}"
-        shadow_text(frame, bpm_str, (px+16, py+80), FS, 0.65, (200,200,200))
-        ratio_col = (50,200,50) if abs(ratio-1.0)<0.05 else (50,200,255)
+        ratio     = bpm_live / bpm_orig if bpm_orig else 1.0
+        ratio_col = (50,200,50) if abs(ratio-1.0) < 0.05 else (50,200,255)
+        shadow_text(frame, f"BPM live: {bpm_live:.1f}",
+                    (px+16, py+80), FS, 0.65, (200,200,200))
         shadow_text(frame, f"ratio: {ratio:.3f}  ref: {bpm_orig:.1f}",
                     (px+16, py+108), FS, 0.52, ratio_col)
+
+        # mirror to PhantomState so the desktop UI stays in sync
+        STATE.set_bpm(
+            bpm_live,
+            raw=dbg.get("bpm_raw"),
+            corrected=dbg.get("bpm_corr"),
+            onset_max=dbg.get("onset_max", 0.0),
+        )
+        LOG.info(f"bpm: live={bpm_live:.1f}  ratio={ratio:.3f}  ref={bpm_orig:.1f}")
     else:
-        shadow_text(frame, "Detectando BPM…", (px+16, py+80), FS, 0.6, (140,140,140))
+        shadow_text(frame, "Detectando BPM...", (px+16, py+80), FS, 0.6, (140,140,140))
 
     # Gesto detectado
-    g_col = PLAY_COLOR if gesture_raw=="PLAY" else \
-            PAUSE_COLOR if gesture_raw=="PAUSE" else NONE_COLOR
+    g_col = PLAY_COLOR  if gesture_raw == "PLAY"  else \
+            PAUSE_COLOR if gesture_raw == "PAUSE" else NONE_COLOR
     g_label = {
-        "PLAY":  "Gesto: Mao Aberta  →  PLAY",
-        "PAUSE": "Gesto: Punho       →  PAUSE",
-        None:    "Gesto: —",
-    }.get(gesture_raw, "Gesto: —")
+        "PLAY":  "Gesto: Mao Aberta  ->  PLAY",
+        "PAUSE": "Gesto: Punho       ->  PAUSE",
+        None:    "Gesto: --",
+    }.get(gesture_raw, "Gesto: --")
     shadow_text(frame, g_label, (px+16, py+135), FS, 0.48, g_col, 1)
 
     # ── Legenda ──────────────────────────────────────────────────────────────
     shadow_text(frame, "Mao Aberta=PLAY   Punho=PAUSE   Q=sair",
                 (12, h-8), FS, 0.42, (100,100,100), 1)
-
 
 def gesture_vision_thread(cam_idx=0):
     """Thread de visão: captura câmera, detecta gestos, aplica play/pause."""
@@ -437,10 +443,11 @@ def gesture_vision_thread(cam_idx=0):
 
     cap = cv2.VideoCapture(cam_idx)
     if not cap.isOpened():
-        print(f"[visão] Não foi possível abrir câmera {cam_idx}.")
+        LOG.err(f"visao: nao foi possivel abrir camera {cam_idx}")
         return
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    LOG.ok(f"camera {cam_idx} aberta: 1280x720")
 
     options = HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
@@ -450,30 +457,28 @@ def gesture_vision_thread(cam_idx=0):
         min_hand_presence_confidence=0.65,
         min_tracking_confidence=0.55,
     )
+    LOG.ok("hand_landmarker carregado")
 
-    stabilizer     = GestureStabilizer(window=10)
-    prev_stable    = None   # último gesto confirmado (evita repetição)
-    prev_time      = time.time()
-
-    # Debounce: só muda estado após MIN_HOLD frames consecutivos do mesmo gesto
-    MIN_HOLD = 8
-    hold_count = 0
+    stabilizer      = GestureStabilizer(window=10)
+    prev_stable     = None
+    prev_time       = time.time()
+    MIN_HOLD        = 8
+    hold_count      = 0
     pending_gesture = None
 
     with HandLandmarker.create_from_options(options) as detector:
         while STATE.alive():
             ret, frame = cap.read()
             if not ret:
+                LOG.err("visao: falha ao ler frame da camera")
                 break
             frame = cv2.flip(frame, 1)
             h_f, w_f = frame.shape[:2]
 
-            # FPS
-            now  = time.time()
-            fps  = 1.0 / max(now - prev_time, 1e-9)
+            now       = time.time()
+            fps       = 1.0 / max(now - prev_time, 1e-9)
             prev_time = now
 
-            # Detecção
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
                               data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             result = detector.detect(mp_img)
@@ -481,8 +486,8 @@ def gesture_vision_thread(cam_idx=0):
             raw_gesture = None
 
             if result.hand_landmarks:
-                hand_lm   = result.hand_landmarks[0]
-                hand_info = result.handedness[0]
+                hand_lm    = result.hand_landmarks[0]
+                hand_info  = result.handedness[0]
                 handedness = hand_info[0].category_name
 
                 lm    = lm_to_array(hand_lm)
@@ -492,31 +497,41 @@ def gesture_vision_thread(cam_idx=0):
                 stable      = stabilizer.update(raw_gesture or "None")
                 stable      = None if stable == "None" else stable
 
-                # ── Debounce: aplica gesto só após MIN_HOLD frames ───────────
+                # ── Debounce ─────────────────────────────────────────────────
                 if stable == pending_gesture:
                     hold_count += 1
                 else:
                     pending_gesture = stable
                     hold_count = 1
 
-                if hold_count >= MIN_HOLD and stable != prev_stable and stable in ("PLAY","PAUSE"):
+                # Mirror hold progress to UI every frame
+                STATE.set_gesture(
+                    stable or "NO HAND",
+                    confidence=0.0,
+                    hold_frames=hold_count,
+                    hands=1,
+                )
+
+                if hold_count >= MIN_HOLD and stable != prev_stable and stable in ("PLAY", "PAUSE"):
                     if stable == "PLAY":
                         STATE.play()
+                        LOG.ok(f"gesto confirmado: PLAY  (hold={hold_count})")
                     else:
                         STATE.pause()
-                    STATE.set_gesture(stable)
+                        LOG.ok(f"gesto confirmado: PAUSE  (hold={hold_count})")
+                    STATE.set_command(stable)
                     prev_stable = stable
                     hold_count  = 0
+                elif stable and stable != prev_stable:
+                    LOG.info(f"gesto: {stable}  hold={hold_count}/{MIN_HOLD}")
 
-                # Cor do esqueleto reflete o gesto atual
-                hand_color = PLAY_COLOR if stable == "PLAY" else \
+                hand_color = PLAY_COLOR  if stable == "PLAY"  else \
                              PAUSE_COLOR if stable == "PAUSE" else (180,180,180)
                 draw_hand(frame, lm_px, hand_color)
 
-                # Label flutuante
-                wx, wy = lm_px[WRIST]
-                label = stable or "…"
-                lbl_col = PLAY_COLOR if stable == "PLAY" else \
+                wx, wy  = lm_px[WRIST]
+                label   = stable or "..."
+                lbl_col = PLAY_COLOR  if stable == "PLAY"  else \
                           PAUSE_COLOR if stable == "PAUSE" else (200,200,200)
                 tw = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.7, 2)[0][0]
                 draw_rect_alpha(frame, wx-tw//2-12, max(wy-55,5),
@@ -525,21 +540,28 @@ def gesture_vision_thread(cam_idx=0):
                             cv2.FONT_HERSHEY_DUPLEX, 0.7, (255,255,255), 2)
 
             else:
+                # No hand visible — clear gesture state
+                if pending_gesture is not None:
+                    LOG.info("gesto: sem mao detectada")
                 pending_gesture = None
                 hold_count      = 0
+                STATE.set_gesture("NO HAND", confidence=0.0, hold_frames=0, hands=0)
 
             draw_hud(frame, raw_gesture, fps)
             cv2.imshow("Phantom Conductor", frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
+                LOG.warn("visao: encerrado pelo usuario (Q)")
                 STATE.stop()
                 break
-            elif key == ord(' '):   # barra de espaço como fallback
-                STATE.toggle()
+            elif key == ord(' '):
+                new_state = STATE.toggle()
+                LOG.info(f"tecla espaco: {'PLAY' if new_state else 'PAUSE'}")
 
     cap.release()
     cv2.destroyAllWindows()
+    LOG.warn("gesture_vision_thread encerrada")
     STATE.stop()
 
 
@@ -607,8 +629,11 @@ def main():
     with sd.InputStream(device=dev_idx, channels=1, samplerate=SR,
                         blocksize=blocksize, callback=audio_callback):
 
-        # Thread de visão roda no thread principal (OpenCV exige)
-        gesture_vision_thread(cam_idx)
+        # Start gesture vision in a thread (it has its own OpenCV window)
+        threading.Thread(target=gesture_vision_thread, args=(cam_idx,), daemon=True).start()
+
+        # Run the desktop UI on the main thread (Dear PyGui requires this)
+        PhantomUI(STATE, LOG).run()
 
         STATE.stop()
         print("\n🛑 Encerrado.")

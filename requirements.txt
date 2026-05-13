@@ -1,0 +1,22 @@
+# Audio
+sounddevice
+numpy
+librosa
+scipy
+pyrubberband
+mutagen
+mido
+
+# Computer Vision / ML
+opencv-python
+mediapipe
+
+# Machine Learning
+scikit-learn
+tqdm
+
+# Serialization (stdlib, no install needed — listed for clarity)
+# pickle — built-in
+
+# UI
+dearpygui
