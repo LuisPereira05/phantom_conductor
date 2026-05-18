@@ -155,6 +155,16 @@ class PhantomUI:
     # ── entry point ───────────────────────────────────────────────────────────
     def setup(self):
         dpg.create_context()
+        CAM_W, CAM_H = 640, 480
+        blank = [0] * (CAM_W * CAM_H * 4)  # RGBA flat list
+        with dpg.texture_registry():
+            dpg.add_dynamic_texture(
+                width=CAM_W, height=CAM_H,
+                default_value=blank,
+                tag="cam_texture"
+            )
+        self._cam_w = CAM_W
+        self._cam_h = CAM_H
         dpg.create_viewport(
             title="Phantom Conductor",
             width=self.WIN_W, height=self.WIN_H,
@@ -490,6 +500,13 @@ class PhantomUI:
                     dpg.add_text("Smooth α", color=C["text_dim"])
                     dpg.add_slider_float(tag="slider_alpha", default_value=0.3,
                                          min_value=0.0, max_value=1.0, width=90)
+    def update_camera_frame(self, frame_bgr):
+        """Call this from the gesture thread via state, or poll from snapshot."""
+        import cv2, numpy as np
+        frame_rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA)
+        frame_rgba = cv2.resize(frame_rgba, (self._cam_w, self._cam_h))
+        flat = frame_rgba.flatten().astype(np.float32) / 255.0
+        dpg.set_value("cam_texture", flat)
 
     def _build_gesture_module(self):
         with dpg.child_window(width=-1, height=270, border=True,
@@ -498,15 +515,11 @@ class PhantomUI:
             dpg.add_separator()
             dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
-                with dpg.drawlist(width=180, height=110, tag="gesture_draw"):
-                    dpg.draw_rectangle((0,0),(180,110), color=C["border"],
-                                       fill=(10,10,10,255), tag="gest_bg")
-                    dpg.draw_text((60,14), "[ ]", tag="gest_icon_draw",
-                                  color=C["text_dim"], size=36)
-                    dpg.draw_text((40,72), "NO HAND", tag="gest_name_draw",
-                                  color=C["text_dim"], size=14)
-                    dpg.draw_text((130,96), "—", tag="gest_conf_draw",
-                                  color=C["text_dim"], size=11)
+                dpg.add_image("cam_texture", width=213, height=160, tag="cam_feed")
+                dpg.add_spacer(width=10)
+                dpg.add_text("[ ]",     tag="gest_icon_draw", color=C["text_dim"])
+                dpg.add_text("NO HAND", tag="gest_name_draw", color=C["text_dim"])
+                dpg.add_text("—",       tag="gest_conf_draw", color=C["text_dim"])
                 dpg.add_spacer(width=10)
                 with dpg.group():
                     dpg.add_text("HOLD", color=C["text_dim"])
@@ -894,6 +907,10 @@ class PhantomUI:
             except Exception: pass
 
     def _update_gesture(self, snap):
+        with self.state._lock:
+            frame = self.state.latest_frame
+        if frame is not None:
+            self.update_camera_frame(frame)
         name   = snap["gesture_name"]
         conf   = snap["gesture_confidence"]
         hold   = snap["gesture_hold_frames"]

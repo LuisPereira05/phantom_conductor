@@ -24,6 +24,14 @@ from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
 
 from logger import Logger
 
+import cv2, sys
+cam = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+cap = cv2.VideoCapture(cam, cv2.CAP_V4L2)  # or CAP_DSHOW on Windows
+print("opened:", cap.isOpened())
+ret, frame = cap.read()
+print("read:", ret, "shape:", frame.shape if ret else None)
+cap.release()
+
 # ── MediaPipe model ────────────────────────────────────────────────────────────
 MODEL_PATH = "hand_landmarker.task"
 MODEL_URL  = (
@@ -31,8 +39,8 @@ MODEL_URL  = (
     "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
 )
 
-FRAME_W = 1280
-FRAME_H = 720
+FRAME_W = 640   # match what your camera actually supports
+FRAME_H = 480
 
 
 def download_model(logger: Logger):
@@ -49,13 +57,16 @@ def download_model(logger: Logger):
 
 
 def open_camera(cam_idx: int, logger: Logger) -> cv2.VideoCapture:
-    """Open the camera at cam_idx at 1280×720.  Raises RuntimeError on failure."""
     cap = cv2.VideoCapture(cam_idx)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera {cam_idx}")
+    
+    # Request resolution and log what we actually got
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-    logger.ok(f"Camera {cam_idx} open: {FRAME_W}×{FRAME_H}")
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    logger.ok(f"Camera {cam_idx} open: {actual_w}x{actual_h}")  # ASCII x, not *
     return cap
 
 

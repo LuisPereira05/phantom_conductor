@@ -130,6 +130,7 @@ class PhantomState:
         self.dev_out: int | None         = None
         self.gain: float                 = 0.85
         self.io_restart_requested: bool  = False
+        self.latest_frame = None 
 
         # Audio levels — set by audio_input callback
         self.rms: float                  = 0.0

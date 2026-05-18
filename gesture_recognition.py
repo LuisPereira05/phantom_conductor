@@ -227,6 +227,9 @@ def gesture_vision_thread(cam_idx: int, state: PhantomState, logger: Logger):
                 logger.err("vision: frame read failed")
                 break
 
+            with state._lock:
+                state.latest_frame = frame  # the BGR numpy array
+
             h_f, w_f = frame.shape[:2]
             now       = time.time()
             fps       = 1.0 / max(now - prev_time, 1e-9)
@@ -298,7 +301,7 @@ def gesture_vision_thread(cam_idx: int, state: PhantomState, logger: Logger):
                                   hold_frames=0, hands=0)
 
             _draw_hud(frame, raw_gesture, fps, state)
-            cv2.imshow("Phantom Conductor — Camera", frame)
+            #cv2.imshow("Phantom Conductor — Camera", frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
