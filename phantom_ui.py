@@ -364,7 +364,7 @@ class PhantomUI:
 
         # Queue selection
         self._queue_sel: int      = -1
-        self._last_queue_sig: tuple = (-1, -1, -1)
+        self._last_queue_sig: tuple = (-1, -1, -1, -1)
 
         # I/O device lists
         self._in_devices:  list = []
@@ -458,6 +458,7 @@ class PhantomUI:
         dpg.bind_theme(g)
 
     # ── file dialog ───────────────────────────────────────────────────────────
+    # ── file dialog ───────────────────────────────────────────────────────────
     def _setup_file_dialog(self):
         with dpg.file_dialog(
             label="Add Track(s)", tag="file_dlg",
@@ -466,25 +467,73 @@ class PhantomUI:
             cancel_callback=lambda s, a, u: None,
             file_count=100,
         ):
-            dpg.add_file_extension(".mp3",  color=C["amber"])
+            # .* first so ALL files show by default (no filter needed)
+            dpg.add_file_extension(".*",    color=C["text_dim"])
             dpg.add_file_extension(".wav",  color=C["green"])
+            dpg.add_file_extension(".mp3",  color=C["amber"])
             dpg.add_file_extension(".flac", color=C["blue"])
             dpg.add_file_extension(".ogg",  color=C["text"])
-            dpg.add_file_extension(".*",    color=C["text_dim"])
 
     def _cb_file_dialog(self, sender, app_data, user_data):
-        selections = app_data.get("selections", {})
-        paths = list(selections.values()) or []
-        if not paths:
-            fp = app_data.get("file_path_name", "")
-            if fp: paths = [fp]
+        # Log raw payload — visible in the System Log panel
+        self.logger.info(f"file_dlg app_data keys: {list(app_data.keys())}")
+
+        # DearPyGui gives us:
+        #   "current_path"   — directory the dialog is browsing
+        #   "file_path_name" — full path of highlighted/typed file (may be dir)
+        #   "selections"     — dict {display_name: full_path} of checked items
+        #                      NOTE: on some DPG builds the value is just the
+        #                      filename, not the full path — we handle both.
+        current_path = app_data.get("current_path", "")
+        selections   = app_data.get("selections", {})
+        file_path    = app_data.get("file_path_name", "")
+
+        self.logger.info(
+            f"file_dlg current_path={current_path!r}  "
+            f"file_path={file_path!r}  "
+            f"selections={selections}"
+        )
+
+        candidates = []
+
+        # 1. Items the user checked in the multi-select list
+        for display_name, sel_path in selections.items():
+            if sel_path and os.path.sep in sel_path:
+                # Full path provided
+                candidates.append(sel_path)
+            else:
+                # Only filename provided — join with current directory
+                name = sel_path or display_name
+                candidates.append(os.path.join(current_path, name))
+
+        # 2. The typed / highlighted path
+        if file_path:
+            if os.path.isabs(file_path):
+                candidates.append(file_path)
+            else:
+                candidates.append(os.path.join(current_path, file_path))
+
+        # De-duplicate, normalise
+        seen, paths = set(), []
+        for p in candidates:
+            p = os.path.normpath(p)
+            if p not in seen:
+                seen.add(p)
+                paths.append(p)
+
+        added = 0
         for path in sorted(paths):
             if not os.path.isfile(path):
+                self.logger.warn(f"skipping (not a file): {path}")
                 continue
             bpm, dur = _read_audio_meta(path)
             self.state.queue.add(path, bpm=bpm, duration=dur)
             flag = f"  BPM={bpm:.1f}" if bpm else "  BPM=? (set manually)"
-            self.logger.ok(f"queue: added {os.path.basename(path)}{flag}")
+            self.logger.ok(f"added: {os.path.basename(path)}{flag}")
+            added += 1
+
+        if added == 0:
+            self.logger.warn("no valid files found in selection")
         self._force_queue_redraw()
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -886,11 +935,12 @@ class PhantomUI:
                 dpg.add_text("DURATION",              color=C["text_dim"])
             dpg.add_separator()
 
-            # scrollable list
-            with dpg.child_window(tag="queue_list", height=-1, border=False,
+            # scrollable list — plain group so delete_item(children_only=True) works reliably
+            with dpg.child_window(tag="queue_list_outer", height=-1, border=False,
                                   horizontal_scrollbar=False):
+                dpg.add_group(tag="queue_list")
                 dpg.add_text("— empty —", tag="queue_empty_label",
-                             color=C["text_dim"])
+                             color=C["text_dim"], parent="queue_list_outer")
 
     # ── Log ───────────────────────────────────────────────────────────────────
     def _build_log_panel(self):
@@ -1215,7 +1265,12 @@ class PhantomUI:
 
     def _update_queue_panel(self):
         tracks, cur = self.state.queue.snapshot()
-        sig = (len(tracks), cur, self._queue_sel)
+        # Include a content hash so any add/remove/BPM-edit triggers a redraw
+        content_hash = hash(tuple(
+            (t["name"], t.get("bpm"), t.get("duration", 0.0))
+            for t in tracks
+        ))
+        sig = (len(tracks), cur, self._queue_sel, content_hash)
         if sig != self._last_queue_sig:
             self._last_queue_sig = sig
             self._refresh_queue_table(tracks, cur)
@@ -1228,26 +1283,30 @@ class PhantomUI:
         except Exception: pass
 
     def _force_queue_redraw(self):
-        """Mark signature dirty so next frame does a full redraw."""
-        self._last_queue_sig = (-1, -1, -1)
+        """Mark signature dirty so the next frame unconditionally redraws."""
+        self._last_queue_sig = (-1, -1, -1, -1)
 
     def _refresh_queue_table(self, tracks, current_idx):
+        # children_only=True is the only DPG API that reliably clears a group atomically
         try:
-            ch = dpg.get_item_children("queue_list", slot=1)
-            if ch:
-                for c in ch: dpg.delete_item(c)
-        except Exception: pass
+            dpg.delete_item("queue_list", children_only=True)
+        except Exception:
+            pass
 
-        if not tracks:
-            dpg.add_text("— empty —", tag="queue_empty_label",
-                         color=C["text_dim"], parent="queue_list")
-            return
+        # Also hide/show the "empty" label that lives in the outer scroll window
+        try:
+            if tracks:
+                dpg.hide_item("queue_empty_label")
+            else:
+                dpg.show_item("queue_empty_label")
+        except Exception:
+            pass
 
         for i, t in enumerate(tracks):
             is_cur  = (i == current_idx)
             is_sel  = (i == self._queue_sel)
             bpm     = t.get("bpm")
-            bpm_str = f"{bpm:.0f}" if bpm else "??"   # red "??" if missing
+            bpm_str = f"{bpm:.0f}" if bpm is not None else "??"
             dur     = t.get("duration", 0.0)
             dur_str = f"{int(dur)//60}:{int(dur)%60:02d}" if dur else "—"
 
@@ -1255,29 +1314,25 @@ class PhantomUI:
                        else C["white"] if is_sel
                        else C["text_dim"])
 
-            # Warn visually when BPM is unknown
-            if bpm is None:
-                bpm_str = "??"
-            prefix = "▶ " if is_cur else f"{i+1:>2}."
-            label  = f"{prefix}  {t['name']:<36}  {bpm_str:<8}  {dur_str}"
+            prefix   = "▶ " if is_cur else f"{i+1:>2}."
+            name_col = t["name"][:38].ljust(38)
+            bpm_col  = bpm_str.ljust(7)
+            label    = f"{prefix}  {name_col}  {bpm_col}  {dur_str}"
 
-            with dpg.group(horizontal=True, parent="queue_list",
-                           tag=f"qrow_{i}"):
-                dpg.add_selectable(
-                    label=label,
-                    tag=f"qsel_{i}",
-                    default_value=is_sel,
-                    callback=self._cb_q_row,
-                    user_data=i,
-                    width=-1,
-                )
-                with dpg.theme() as rt:
-                    with dpg.theme_component(dpg.mvSelectable):
-                        dpg.add_theme_color(dpg.mvThemeCol_Text, row_col)
-                        if is_sel:
-                            dpg.add_theme_color(dpg.mvThemeCol_Header,
-                                                C["select"])
-                dpg.bind_item_theme(f"qsel_{i}", rt)
+            sel = dpg.add_selectable(
+                label=label,
+                default_value=is_sel,
+                callback=self._cb_q_row,
+                user_data=i,
+                width=-1,
+                parent="queue_list",
+            )
+            with dpg.theme() as rt:
+                with dpg.theme_component(dpg.mvSelectable):
+                    dpg.add_theme_color(dpg.mvThemeCol_Text, row_col)
+                    if is_sel:
+                        dpg.add_theme_color(dpg.mvThemeCol_Header, C["select"])
+            dpg.bind_item_theme(sel, rt)
 
     def _update_log(self):
         if self._tick % 6 != 0: return
