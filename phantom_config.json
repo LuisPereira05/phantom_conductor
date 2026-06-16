@@ -6,7 +6,9 @@
   "cam_index": 0,
   "gesture_map": {
     "PLAY": "play",
-    "PAUSE": "pause"
+    "PAUSE": "pause",
+    "POINT": "next",
+    "PEACE": "loop_toggle"
   },
   "gesture_hold_frames": 8,
   "use_pedal": false,

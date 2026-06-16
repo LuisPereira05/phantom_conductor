@@ -57,7 +57,7 @@ import cv2
 from config import CFG
 from state  import PhantomState
 from logger import Logger
-
+from gesture_train_ui import GestureTrainUI
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  COLOUR PALETTE
@@ -147,7 +147,7 @@ def _read_audio_meta(path: str) -> tuple[float | None, float]:
 #  PHANTOM UI
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class PhantomUI:
+class PhantomUI(GestureTrainUI):
     WIN_W, WIN_H = 1420, 900   # slightly taller to accommodate Settings panel
 
     # How often (in render ticks) to push a new camera frame to the texture.
@@ -217,6 +217,7 @@ class PhantomUI:
         self._in_devices, self._out_devices = _sd_devices()
         self._build_ui()
         self._setup_file_dialog()
+        self._build_train_popup()
         dpg.setup_dearpygui()
         dpg.show_viewport()
 
@@ -229,6 +230,7 @@ class PhantomUI:
             self._update_waveform(snap)
             self._update_transport(snap)
             self._update_gesture(snap)
+            self._update_train_ui()
             self._update_queue_panel()
             self._update_io_status(snap)
             self._sync_gain()
@@ -337,7 +339,7 @@ class PhantomUI:
 
             with dpg.group(horizontal=True):
                 with dpg.child_window(width=710, height=-138,
-                                      border=False, tag="left_col"):
+                                      border=False, tag="left_col", resizable_x=True):
                     self._build_bpm_module()
                     dpg.add_spacer(height=4)
                     self._build_waveform_module()
@@ -369,6 +371,12 @@ class PhantomUI:
                 dpg.add_text("RUNNING", tag="sys_state", color=C["text_dim"])
                 dpg.add_spacer(width=20)
                 dpg.add_text("00:00:00", tag="sys_clock", color=C["text_dim"])
+                dpg.add_spacer(width=20)
+                dpg.add_button(label=" TRAIN GESTURES ",
+                    tag="btn_train_open",
+                    callback=self._cb_train_open,
+                    width=140)
+                dpg.bind_item_theme("btn_train_open", self._th_blue)
 
     def _build_bpm_module(self):
         with dpg.child_window(height=130, border=True, tag="bpm_panel"):
@@ -472,12 +480,12 @@ class PhantomUI:
     def _build_settings_module(self):
         in_names  = [n for _, n in self._in_devices]
         out_names = [n for _, n in self._out_devices]
-
-        with dpg.child_window(height=220, border=True, tag="settings_panel"):
+ 
+        with dpg.child_window(height=240, border=True, tag="settings_panel"):
             dpg.add_text("SETTINGS", color=C["text_dim"])
             dpg.add_separator()
             dpg.add_spacer(height=4)
-
+ 
             # ── Row 1: Audio I/O devices ──────────────────────────────────────
             with dpg.group(horizontal=True):
                 dpg.add_text("AUDIO", color=C["amber"])
@@ -496,12 +504,12 @@ class PhantomUI:
                 dpg.add_spacer(width=6)
                 with dpg.group():
                     dpg.add_spacer(height=17)
-                    dpg.add_button(label=" ▶ APPLY ", tag="io_apply_btn",
+                    dpg.add_button(label=" APPLY ", tag="io_apply_btn",
                                    callback=self._cb_io_apply, width=88)
                     dpg.bind_item_theme("io_apply_btn", self._th_grn)
-
+ 
             dpg.add_spacer(height=4)
-
+ 
             # ── Row 2: Gain sliders ───────────────────────────────────────────
             with dpg.group(horizontal=True):
                 dpg.add_text("GAIN", color=C["amber"])
@@ -526,9 +534,9 @@ class PhantomUI:
                     dpg.add_spacer(width=4)
                     dpg.add_text("not started", tag="io_status",
                                  color=C["text_dim"])
-
+ 
             dpg.add_spacer(height=6)
-
+ 
             # ── Row 3: Video device ───────────────────────────────────────────
             with dpg.group(horizontal=True):
                 dpg.add_text("VIDEO", color=C["amber"])
@@ -542,57 +550,72 @@ class PhantomUI:
                 dpg.add_spacer(width=10)
                 dpg.add_text("(restart required to take effect)",
                              color=C["text_dim"])
-
+ 
             dpg.add_spacer(height=6)
-
-            # ── Row 4: Hand command mapper + auxiliary toggles ─────────────────
+ 
+            # ── Row 4: Gesture command mapper ─────────────────────────────────
+            _ALL_CMDS = ["play", "pause", "toggle", "next", "prev",
+                         "loop_toggle", "loop_next", "loop_prev", "none"]
+ 
             with dpg.group(horizontal=True):
                 dpg.add_text("GESTURES", color=C["amber"])
                 dpg.add_spacer(width=8)
-
-                # Open-hand command
-                with dpg.group(width=170):
-                    dpg.add_text("Open Hand →", color=C["text_dim"])
+ 
+                with dpg.group(width=154):
+                    dpg.add_text("Open Hand (5)", color=C["text_dim"])
                     dpg.add_combo(
-                        items=["play", "pause", "next", "prev", "none"],
-                        tag="gmap_play_combo",
+                        items=_ALL_CMDS, tag="gmap_play_combo",
                         default_value=CFG.gesture_map.get("PLAY", "play"),
-                        width=162,
+                        width=146,
                         callback=lambda s, a, u: self._cb_gesture_map("PLAY", a),
                     )
-                dpg.add_spacer(width=6)
-
-                # Fist command
-                with dpg.group(width=170):
-                    dpg.add_text("Fist →", color=C["text_dim"])
+                dpg.add_spacer(width=4)
+ 
+                with dpg.group(width=154):
+                    dpg.add_text("Fist (0)", color=C["text_dim"])
                     dpg.add_combo(
-                        items=["play", "pause", "next", "prev", "none"],
-                        tag="gmap_pause_combo",
+                        items=_ALL_CMDS, tag="gmap_pause_combo",
                         default_value=CFG.gesture_map.get("PAUSE", "pause"),
-                        width=162,
+                        width=146,
                         callback=lambda s, a, u: self._cb_gesture_map("PAUSE", a),
                     )
-                dpg.add_spacer(width=10)
-
-                # Hold threshold
-                with dpg.group(width=140):
+                dpg.add_spacer(width=4)
+ 
+                with dpg.group(width=154):
+                    dpg.add_text("Index / Point (1)", color=C["text_dim"])
+                    dpg.add_combo(
+                        items=_ALL_CMDS, tag="gmap_point_combo",
+                        default_value=CFG.gesture_map.get("POINT", "next"),
+                        width=146,
+                        callback=lambda s, a, u: self._cb_gesture_map("POINT", a),
+                    )
+                dpg.add_spacer(width=4)
+ 
+                with dpg.group(width=154):
+                    dpg.add_text("Peace / V (2)", color=C["text_dim"])
+                    dpg.add_combo(
+                        items=_ALL_CMDS, tag="gmap_peace_combo",
+                        default_value=CFG.gesture_map.get("PEACE", "loop_toggle"),
+                        width=146,
+                        callback=lambda s, a, u: self._cb_gesture_map("PEACE", a),
+                    )
+                dpg.add_spacer(width=6)
+ 
+                with dpg.group(width=130):
                     dpg.add_text("Hold frames", color=C["text_dim"])
                     dpg.add_input_int(tag="cfg_hold_frames",
                                       default_value=CFG.gesture_hold_frames,
                                       min_value=1, max_value=60, width=80,
                                       callback=self._cb_hold_frames)
-                dpg.add_spacer(width=10)
-
-                # Pedal + tapper checkboxes
-                with dpg.group():
-                    dpg.add_checkbox(label=" Use foot pedal",
+                    dpg.add_checkbox(label=" Foot pedal",
                                      tag="cfg_use_pedal",
                                      default_value=CFG.use_pedal,
                                      callback=self._cb_use_pedal)
-                    dpg.add_checkbox(label=" Use tempo tapper",
+                    dpg.add_checkbox(label=" Tempo tapper",
                                      tag="cfg_use_tapper",
                                      default_value=CFG.use_tempo_tapper,
                                      callback=self._cb_use_tapper)
+ 
 
     def _build_stretch_module(self):
         """Reference BPM editor, buffer fill, smoothing α — kept separate."""
