@@ -8,11 +8,25 @@ Panels
 * BPM Detection    — live BPM readout, ratio bar, debug row
 * Input Level      — waveform bars, RMS / peak meters
 * Backing Track    — transport controls, timeline scrubber, markers
-* Audio I/O        — device pickers, gain slider, APPLY button
+* Settings         — audio I/O, gain sliders, video device, hand
+                     command mapper, pedal toggle, tempo-tapper toggle
 * Time-Stretch     — reference BPM editor, buffer fill, smoothing α
-* Gesture Control  — hand icon, hold bar, camera status
+* Gesture Control  — live camera feed (flicker-free), hold bar
 * Track Queue      — scrollable list, inline BPM editor, reorder/load/remove
+                     (persisted to tracklist.json automatically)
 * System Log       — scrollable log drain
+
+Changes from v0.5.0
+--------------------
+1. Audio I/O, gain, cam index, gesture map, pedal, tempo-tapper moved
+   into a dedicated collapsible Settings panel (no longer split across
+   two separate panels).
+2. Track list is persistent via PersistentQueue / tracklist.json.
+3. Camera feed no longer flashes:
+   - Texture upload is rate-limited (max 30 fps via frame counter).
+   - upload converts BGR→RGBA once and reuses a pre-allocated buffer.
+   - Gesture-draw items are now updated with dpg.configure_item instead
+     of delete/redraw every frame (eliminates the 1-frame blank flash).
 
 Install:
     pip install dearpygui mutagen sounddevice
@@ -21,6 +35,7 @@ Install:
 import math
 import os
 import time
+import numpy as np
 import threading
 
 import dearpygui.dearpygui as dpg
@@ -37,6 +52,9 @@ try:
 except ImportError:
     HAS_MUTAGEN = False
 
+import cv2
+
+from config import CFG
 from state  import PhantomState
 from logger import Logger
 
@@ -67,6 +85,9 @@ C = {
 }
 
 GESTURE_ICONS = {"NO HAND": " — ", "PLAY": "[O]", "PAUSE": "[F]"}
+
+CAM_W, CAM_H   = 640, 480
+_BLANK_TEXTURE  = [0.0] * (CAM_W * CAM_H * 4)   # pre-allocated RGBA float32
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -127,7 +148,11 @@ def _read_audio_meta(path: str) -> tuple[float | None, float]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PhantomUI:
-    WIN_W, WIN_H = 1420, 840
+    WIN_W, WIN_H = 1420, 900   # slightly taller to accommodate Settings panel
+
+    # How often (in render ticks) to push a new camera frame to the texture.
+    # At ~60 fps this gives ~30 texture uploads / second — smooth but cheap.
+    _CAM_UPLOAD_EVERY = 2
 
     def __init__(self, state: PhantomState, logger: Logger):
         self.state  = state
@@ -142,6 +167,13 @@ class PhantomUI:
         self._in_sel:  int = 0
         self._out_sel: int = 0
 
+        # Camera texture buffer — reused every frame (no GC churn)
+        self._cam_buf = np.zeros((CAM_H, CAM_W, 4), dtype=np.float32)
+
+        # Last gesture state — only update DPG items when they change
+        self._last_gesture: str       = ""
+        self._last_gesture_col: tuple = C["text_dim"]
+
     # ── theme helpers ─────────────────────────────────────────────────────────
     def _btn(self, fg, bg, bd):
         with dpg.theme() as t:
@@ -155,20 +187,20 @@ class PhantomUI:
     # ── entry point ───────────────────────────────────────────────────────────
     def setup(self):
         dpg.create_context()
-        CAM_W, CAM_H = 640, 480
-        blank = [0] * (CAM_W * CAM_H * 4)  # RGBA flat list
+
         with dpg.texture_registry():
             dpg.add_dynamic_texture(
                 width=CAM_W, height=CAM_H,
-                default_value=blank,
-                tag="cam_texture"
+                default_value=_BLANK_TEXTURE,
+                tag="cam_texture",
             )
         self._cam_w = CAM_W
         self._cam_h = CAM_H
+
         dpg.create_viewport(
             title="Phantom Conductor",
             width=self.WIN_W, height=self.WIN_H,
-            min_width=1100, min_height=700,
+            min_width=1100, min_height=750,
             resizable=True,
         )
         self._apply_theme()
@@ -282,6 +314,7 @@ class PhantomUI:
                 self.logger.warn(f"skipping (not a file): {path}")
                 continue
             bpm, dur = _read_audio_meta(path)
+            # PersistentQueue.add() saves to JSON automatically
             self.state.queue.add(path, bpm=bpm, duration=dur)
             flag = f"  BPM={bpm:.1f}" if bpm else "  BPM=? (set manually)"
             self.logger.ok(f"added: {os.path.basename(path)}{flag}")
@@ -311,9 +344,9 @@ class PhantomUI:
                     dpg.add_spacer(height=4)
                     self._build_transport_module()
                     dpg.add_spacer(height=4)
-                    self._build_io_module()
+                    self._build_settings_module()   # ← replaces old I/O + controls
                     dpg.add_spacer(height=4)
-                    self._build_controls_module()
+                    self._build_stretch_module()
 
                 dpg.add_spacer(width=4)
 
@@ -330,7 +363,7 @@ class PhantomUI:
         with dpg.child_window(height=34, border=True, tag="hdr"):
             with dpg.group(horizontal=True):
                 dpg.add_text("PHANTOM CONDUCTOR", color=C["amber"])
-                dpg.add_text("  v0.5.0", color=C["text_dim"])
+                dpg.add_text("  v0.5.1", color=C["text_dim"])
                 dpg.add_spacer(width=20)
                 dpg.add_text("●", tag="sys_led", color=C["green"])
                 dpg.add_text("RUNNING", tag="sys_state", color=C["text_dim"])
@@ -344,7 +377,7 @@ class PhantomUI:
             with dpg.group(horizontal=True):
                 with dpg.group():
                     with dpg.drawlist(width=120, height=56, tag="bpm_draw"):
-                        dpg.draw_text((0,0), "---", tag="bpm_draw_text",
+                        dpg.draw_text((0, 0), "---", tag="bpm_draw_text",
                                       color=C["amber"], size=50)
                 dpg.add_spacer(width=16)
                 with dpg.group():
@@ -369,12 +402,12 @@ class PhantomUI:
                     dpg.add_text("0.000", tag="onset_val", color=C["text_dim"])
 
             dpg.add_spacer(height=4)
-            with dpg.drawlist(width=680, height=12, tag="ratio_bar_draw"):
-                dpg.draw_rectangle((0,4),(680,10), color=C["border"],
+            with dpg.drawlist(width=688, height=12, tag="ratio_bar_draw"):
+                dpg.draw_rectangle((0, 4), (688, 10), color=C["border"],
                                    fill=C["panel2"], tag="ratio_track")
-                dpg.draw_line((340,2),(340,14), color=C["border2"],
+                dpg.draw_line((340, 2), (340, 14), color=C["border2"],
                               tag="ratio_center")
-                dpg.draw_rectangle((340,4),(340,10), color=C["amber"],
+                dpg.draw_rectangle((340, 4), (340, 10), color=C["amber"],
                                    fill=C["amber"], tag="ratio_fill")
             with dpg.group(horizontal=True):
                 dpg.add_text("0.5×", color=C["text_dim"])
@@ -407,11 +440,11 @@ class PhantomUI:
                 dpg.add_text("—", tag="file_meta", color=C["text_dim"])
             dpg.add_spacer(height=4)
             with dpg.drawlist(width=688, height=20, tag="timeline_draw"):
-                dpg.draw_rectangle((0,0),(688,20), color=C["border"],
+                dpg.draw_rectangle((0, 0), (688, 20), color=C["border"],
                                    fill=C["panel2"], tag="tl_bg")
-                dpg.draw_rectangle((0,0),(0,20), color=C["amber_dim"],
+                dpg.draw_rectangle((0, 0), (0, 20), color=C["amber_dim"],
                                    fill=C["amber_faint"], tag="tl_fill")
-                dpg.draw_line((0,0),(0,20), color=C["amber"], tag="tl_head")
+                dpg.draw_line((0, 0), (0, 20), color=C["amber"], tag="tl_head")
             dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
                 dpg.add_button(label=" |<  ", tag="btn_prev",
@@ -433,44 +466,136 @@ class PhantomUI:
                 dpg.add_text("0:00 / 0:00", tag="time_display",
                              color=C["text_dim"])
 
-    def _build_io_module(self):
+    # ─────────────────────────────────────────────────────────────────────────
+    #  SETTINGS PANEL  (replaces old Audio I/O + Controls modules)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_settings_module(self):
         in_names  = [n for _, n in self._in_devices]
         out_names = [n for _, n in self._out_devices]
 
-        with dpg.child_window(height=114, border=True, tag="io_panel"):
-            dpg.add_text("AUDIO I/O  — select devices then click APPLY",
-                         color=C["text_dim"])
+        with dpg.child_window(height=220, border=True, tag="settings_panel"):
+            dpg.add_text("SETTINGS", color=C["text_dim"])
+            dpg.add_separator()
             dpg.add_spacer(height=4)
+
+            # ── Row 1: Audio I/O devices ──────────────────────────────────────
             with dpg.group(horizontal=True):
-                with dpg.group(width=290):
-                    dpg.add_text("MIC INPUT", color=C["text_dim"])
+                dpg.add_text("AUDIO", color=C["amber"])
+                dpg.add_spacer(width=8)
+                with dpg.group(width=255):
+                    dpg.add_text("Mic Input", color=C["text_dim"])
                     dpg.add_combo(items=in_names, tag="io_in_combo",
                                   default_value=in_names[0] if in_names else "",
-                                  width=282, callback=self._cb_io_in)
-                dpg.add_spacer(width=8)
-                with dpg.group(width=290):
-                    dpg.add_text("SPEAKER OUTPUT", color=C["text_dim"])
+                                  width=248, callback=self._cb_io_in)
+                dpg.add_spacer(width=6)
+                with dpg.group(width=255):
+                    dpg.add_text("Speaker Output", color=C["text_dim"])
                     dpg.add_combo(items=out_names, tag="io_out_combo",
                                   default_value=out_names[0] if out_names else "",
-                                  width=282, callback=self._cb_io_out)
-                dpg.add_spacer(width=8)
-                with dpg.group(width=110):
-                    dpg.add_text("GAIN", color=C["text_dim"])
-                    dpg.add_slider_float(tag="io_gain", default_value=0.85,
-                                         min_value=0.0, max_value=2.0, width=100)
-                dpg.add_spacer(width=8)
+                                  width=248, callback=self._cb_io_out)
+                dpg.add_spacer(width=6)
                 with dpg.group():
-                    dpg.add_spacer(height=18)
+                    dpg.add_spacer(height=17)
                     dpg.add_button(label=" ▶ APPLY ", tag="io_apply_btn",
-                                   callback=self._cb_io_apply, width=90)
+                                   callback=self._cb_io_apply, width=88)
                     dpg.bind_item_theme("io_apply_btn", self._th_grn)
-            dpg.add_spacer(height=4)
-            with dpg.group(horizontal=True):
-                dpg.add_text("●", tag="io_led", color=C["text_dim"])
-                dpg.add_text("not started — click APPLY to activate streams",
-                             tag="io_status", color=C["text_dim"])
 
-    def _build_controls_module(self):
+            dpg.add_spacer(height=4)
+
+            # ── Row 2: Gain sliders ───────────────────────────────────────────
+            with dpg.group(horizontal=True):
+                dpg.add_text("GAIN", color=C["amber"])
+                dpg.add_spacer(width=8)
+                with dpg.group(width=180):
+                    dpg.add_text("Input (mic pre-gain)", color=C["text_dim"])
+                    dpg.add_slider_float(tag="gain_input", width=170,
+                                         default_value=CFG.input_gain,
+                                         min_value=0.0, max_value=3.0,
+                                         format="%.2f")
+                dpg.add_spacer(width=10)
+                with dpg.group(width=180):
+                    dpg.add_text("Output (backing track)", color=C["text_dim"])
+                    dpg.add_slider_float(tag="io_gain", width=170,
+                                         default_value=CFG.output_gain,
+                                         min_value=0.0, max_value=2.0,
+                                         format="%.2f")
+                dpg.add_spacer(width=10)
+                with dpg.group(horizontal=True):
+                    dpg.add_text("I/O:", color=C["text_dim"])
+                    dpg.add_text("●", tag="io_led", color=C["text_dim"])
+                    dpg.add_spacer(width=4)
+                    dpg.add_text("not started", tag="io_status",
+                                 color=C["text_dim"])
+
+            dpg.add_spacer(height=6)
+
+            # ── Row 3: Video device ───────────────────────────────────────────
+            with dpg.group(horizontal=True):
+                dpg.add_text("VIDEO", color=C["amber"])
+                dpg.add_spacer(width=8)
+                with dpg.group(width=220):
+                    dpg.add_text("Camera Index", color=C["text_dim"])
+                    dpg.add_input_int(tag="cfg_cam_index",
+                                      default_value=CFG.cam_index,
+                                      min_value=0, max_value=15, width=90,
+                                      callback=self._cb_cam_index)
+                dpg.add_spacer(width=10)
+                dpg.add_text("(restart required to take effect)",
+                             color=C["text_dim"])
+
+            dpg.add_spacer(height=6)
+
+            # ── Row 4: Hand command mapper + auxiliary toggles ─────────────────
+            with dpg.group(horizontal=True):
+                dpg.add_text("GESTURES", color=C["amber"])
+                dpg.add_spacer(width=8)
+
+                # Open-hand command
+                with dpg.group(width=170):
+                    dpg.add_text("Open Hand →", color=C["text_dim"])
+                    dpg.add_combo(
+                        items=["play", "pause", "next", "prev", "none"],
+                        tag="gmap_play_combo",
+                        default_value=CFG.gesture_map.get("PLAY", "play"),
+                        width=162,
+                        callback=lambda s, a, u: self._cb_gesture_map("PLAY", a),
+                    )
+                dpg.add_spacer(width=6)
+
+                # Fist command
+                with dpg.group(width=170):
+                    dpg.add_text("Fist →", color=C["text_dim"])
+                    dpg.add_combo(
+                        items=["play", "pause", "next", "prev", "none"],
+                        tag="gmap_pause_combo",
+                        default_value=CFG.gesture_map.get("PAUSE", "pause"),
+                        width=162,
+                        callback=lambda s, a, u: self._cb_gesture_map("PAUSE", a),
+                    )
+                dpg.add_spacer(width=10)
+
+                # Hold threshold
+                with dpg.group(width=140):
+                    dpg.add_text("Hold frames", color=C["text_dim"])
+                    dpg.add_input_int(tag="cfg_hold_frames",
+                                      default_value=CFG.gesture_hold_frames,
+                                      min_value=1, max_value=60, width=80,
+                                      callback=self._cb_hold_frames)
+                dpg.add_spacer(width=10)
+
+                # Pedal + tapper checkboxes
+                with dpg.group():
+                    dpg.add_checkbox(label=" Use foot pedal",
+                                     tag="cfg_use_pedal",
+                                     default_value=CFG.use_pedal,
+                                     callback=self._cb_use_pedal)
+                    dpg.add_checkbox(label=" Use tempo tapper",
+                                     tag="cfg_use_tapper",
+                                     default_value=CFG.use_tempo_tapper,
+                                     callback=self._cb_use_tapper)
+
+    def _build_stretch_module(self):
+        """Reference BPM editor, buffer fill, smoothing α — kept separate."""
         with dpg.child_window(height=96, border=True, tag="ctrl_panel"):
             dpg.add_text("TIME-STRETCH / REFERENCE BPM", color=C["text_dim"])
             dpg.add_spacer(height=4)
@@ -498,16 +623,13 @@ class PhantomUI:
                     dpg.add_text("44100 Hz", color=C["text"])
                 with dpg.group(width=100):
                     dpg.add_text("Smooth α", color=C["text_dim"])
-                    dpg.add_slider_float(tag="slider_alpha", default_value=0.3,
+                    dpg.add_slider_float(tag="slider_alpha",
+                                         default_value=CFG.smooth_alpha,
                                          min_value=0.0, max_value=1.0, width=90)
-    def update_camera_frame(self, frame_bgr):
-        """Call this from the gesture thread via state, or poll from snapshot."""
-        import cv2, numpy as np
-        frame_rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA)
-        frame_rgba = cv2.resize(frame_rgba, (self._cam_w, self._cam_h))
-        flat = frame_rgba.flatten().astype(np.float32) / 255.0
-        dpg.set_value("cam_texture", flat)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  GESTURE / CAMERA PANEL  (flicker-free)
+    # ─────────────────────────────────────────────────────────────────────────
     def _build_gesture_module(self):
         with dpg.child_window(width=-1, height=270, border=True,
                               tag="gesture_panel"):
@@ -515,11 +637,15 @@ class PhantomUI:
             dpg.add_separator()
             dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
-                dpg.add_image("cam_texture", width=213, height=160, tag="cam_feed")
+                # Camera feed — image widget backed by dynamic texture
+                dpg.add_image("cam_texture", width=213, height=160,
+                              tag="cam_feed")
                 dpg.add_spacer(width=10)
-                dpg.add_text("[ ]",     tag="gest_icon_draw", color=C["text_dim"])
-                dpg.add_text("NO HAND", tag="gest_name_draw", color=C["text_dim"])
-                dpg.add_text("—",       tag="gest_conf_draw", color=C["text_dim"])
+                with dpg.group():
+                    # Static text items updated in-place (no delete/redraw)
+                    dpg.add_text("[ ]",     tag="gest_icon",  color=C["text_dim"])
+                    dpg.add_text("NO HAND", tag="gest_name",  color=C["text_dim"])
+                    dpg.add_text("—",       tag="gest_conf",  color=C["text_dim"])
                 dpg.add_spacer(width=10)
                 with dpg.group():
                     dpg.add_text("HOLD", color=C["text_dim"])
@@ -570,6 +696,9 @@ class PhantomUI:
                 dpg.add_button(label=" CLEAR ALL ", tag="btn_q_clear",
                                callback=self._cb_q_clear, width=84)
                 dpg.bind_item_theme("btn_q_clear", self._th_red)
+                dpg.add_spacer(width=8)
+                dpg.add_text("💾 auto-saved", tag="queue_save_indicator",
+                             color=C["text_dim"])
 
             dpg.add_spacer(height=6)
             with dpg.child_window(height=52, border=True, tag="bpm_edit_box"):
@@ -588,19 +717,12 @@ class PhantomUI:
                                  tag="q_bpm_hint", color=C["text_dim"])
 
             dpg.add_spacer(height=4)
-            with dpg.group(horizontal=True):
-                dpg.add_text("   #  FILE",  color=C["text_dim"])
-                dpg.add_spacer(width=140)
-                dpg.add_text("BPM",         color=C["text_dim"])
-                dpg.add_spacer(width=36)
-                dpg.add_text("DURATION",    color=C["text_dim"])
-            dpg.add_separator()
 
+            # Scrollable list area — table is rebuilt inside here each redraw
             with dpg.child_window(tag="queue_list_outer", height=-1, border=False,
                                   horizontal_scrollbar=False):
-                dpg.add_group(tag="queue_list")
                 dpg.add_text("— empty —", tag="queue_empty_label",
-                             color=C["text_dim"], parent="queue_list_outer")
+                             color=C["text_dim"])
 
     def _build_log_panel(self):
         with dpg.child_window(height=130, border=True, tag="log_panel"):
@@ -669,16 +791,46 @@ class PhantomUI:
             (i for i, (_, n) in enumerate(self._out_devices) if n == app_data), 0)
 
     def _cb_io_apply(self):
-        dev_in  = self._in_devices[self._in_sel][0]  if self._in_devices  else None
-        dev_out = self._out_devices[self._out_sel][0] if self._out_devices else None
+        dev_in   = self._in_devices[self._in_sel][0]  if self._in_devices  else None
+        dev_out  = self._out_devices[self._out_sel][0] if self._out_devices else None
         if isinstance(dev_in,  int) and dev_in  < 0: dev_in  = None
         if isinstance(dev_out, int) and dev_out < 0: dev_out = None
-        self.state.request_io_restart(dev_in, dev_out)
+        in_gain  = dpg.get_value("gain_input")
+        out_gain = dpg.get_value("io_gain")
+        self.state.request_io_restart(dev_in, dev_out,
+                                       input_gain=in_gain, output_gain=out_gain)
         in_lbl  = self._in_devices[self._in_sel][1]  if self._in_devices  else "default"
         out_lbl = self._out_devices[self._out_sel][1] if self._out_devices else "default"
-        self.logger.ok(f"I/O apply: in=[{in_lbl}]  out=[{out_lbl}]")
+        self.logger.ok(
+            f"I/O apply: in=[{in_lbl}]  out=[{out_lbl}]  "
+            f"in_gain={in_gain:.2f}  out_gain={out_gain:.2f}"
+        )
         dpg.configure_item("io_led", color=C["amber"])
         dpg.set_value("io_status", "applying…")
+
+    def _cb_cam_index(self, sender, app_data, user_data):
+        CFG.set("cam_index", app_data)
+        self.logger.info(f"cam index → {app_data}  (restart to apply)")
+
+    def _cb_gesture_map(self, gesture_key: str, value: str):
+        gmap = dict(CFG.gesture_map)
+        gmap[gesture_key] = value
+        CFG.set("gesture_map", gmap)
+        self.logger.info(f"gesture map: {gesture_key} → {value}")
+
+    def _cb_hold_frames(self, sender, app_data, user_data):
+        CFG.set("gesture_hold_frames", app_data)
+        with self.state._lock:
+            self.state.gesture_hold_target = app_data
+        self.logger.info(f"hold frames → {app_data}")
+
+    def _cb_use_pedal(self, sender, app_data, user_data):
+        CFG.set("use_pedal", app_data)
+        self.logger.info(f"foot pedal: {'ON' if app_data else 'OFF'}")
+
+    def _cb_use_tapper(self, sender, app_data, user_data):
+        CFG.set("use_tempo_tapper", app_data)
+        self.logger.info(f"tempo tapper: {'ON' if app_data else 'OFF'}")
 
     def _cb_set_ref_bpm(self):
         bpm = dpg.get_value("ctrl_bpm_input")
@@ -707,6 +859,7 @@ class PhantomUI:
         tracks, _ = self.state.queue.snapshot()
         if self._queue_sel < len(tracks):
             name = tracks[self._queue_sel]["name"]
+            # PersistentQueue.remove() saves JSON automatically
             self.state.queue.remove(self._queue_sel)
             tracks2, _ = self.state.queue.snapshot()
             self._queue_sel = min(self._queue_sel, len(tracks2) - 1)
@@ -714,10 +867,7 @@ class PhantomUI:
             self._force_queue_redraw()
 
     def _cb_q_clear(self):
-        q = self.state.queue
-        with q._lock:
-            q._tracks.clear()
-            q._index = 0
+        self.state.queue.clear()   # PersistentQueue.clear() saves JSON
         self._queue_sel = -1
         self.logger.info("queue: cleared")
         self._force_queue_redraw()
@@ -748,7 +898,7 @@ class PhantomUI:
             return
         bpm = dpg.get_value("q_bpm_input")
         if not bpm or bpm <= 0: return
-        self.state.queue.set_bpm(self._queue_sel, bpm)
+        self.state.queue.set_bpm(self._queue_sel, bpm)   # auto-saves JSON
         _, current_idx = self.state.queue.snapshot()
         if self._queue_sel == current_idx:
             self.state.set_bpm_original(bpm)
@@ -763,9 +913,9 @@ class PhantomUI:
     # ═════════════════════════════════════════════════════════════════════════
 
     def _sync_gain(self):
-        gain = dpg.get_value("io_gain")
+        out_gain = dpg.get_value("io_gain")
         with self.state._lock:
-            self.state.gain = gain
+            self.state.gain = out_gain
 
     def _update_io_status(self, snap: dict):
         if snap.get("io_restart_requested"):
@@ -778,7 +928,7 @@ class PhantomUI:
             if dev_in is not None or dev_out is not None:
                 dpg.configure_item("io_led", color=C["green"])
                 dpg.set_value("io_status",
-                              f"active  in={dev_in}  out={dev_out}  gain={gain:.2f}")
+                              f"active  in={dev_in}  out={dev_out}")
             else:
                 dpg.configure_item("io_led", color=C["text_dim"])
                 dpg.set_value("io_status",
@@ -803,9 +953,10 @@ class PhantomUI:
 
         try:
             dpg.delete_item("bpm_draw_text")
-            dpg.draw_text((0,0), bpm_str, parent="bpm_draw",
+            dpg.draw_text((0, 0), bpm_str, parent="bpm_draw",
                           tag="bpm_draw_text", color=col, size=50)
-        except Exception: pass
+        except Exception:
+            pass
 
         dpg.set_value("bpm_source", snap["bpm_source"])
         dpg.set_value("ratio_val",  f"{ratio:.3f}")
@@ -819,7 +970,8 @@ class PhantomUI:
         try:
             if not dpg.is_item_focused("ctrl_bpm_input"):
                 dpg.set_value("ctrl_bpm_input", orig)
-        except Exception: pass
+        except Exception:
+            pass
 
         def rx(r):
             return 340 + (math.log2(max(0.5, min(2.0, r))) * 340)
@@ -831,7 +983,8 @@ class PhantomUI:
             lo, hi = (340, x) if ratio >= 1.0 else (x, 340)
             dpg.draw_rectangle((lo, 4), (hi, 10), color=fc, fill=fc,
                                parent="ratio_bar_draw", tag="ratio_fill")
-        except Exception: pass
+        except Exception:
+            pass
 
     def _update_waveform(self, snap):
         wave = snap["waveform"][-64:]
@@ -846,7 +999,8 @@ class PhantomUI:
         try:
             dpg.delete_item("wave_bars", children_only=True)
             dpg.delete_item("wave_bars")
-        except Exception: pass
+        except Exception:
+            pass
         try:
             bw = 590 // max(1, len(wave))
             with dpg.draw_node(parent="waveform_draw", tag="wave_bars"):
@@ -856,10 +1010,11 @@ class PhantomUI:
                     shade = (C["amber"] if v > 0.7
                              else C["amber_dim"] if v > 0.3
                              else C["amber_faint"])
-                    dpg.draw_rectangle((x, 25 - h//2),
-                                       (x + max(1, bw-1), 25 + h//2),
+                    dpg.draw_rectangle((x, 25 - h // 2),
+                                       (x + max(1, bw - 1), 25 + h // 2),
                                        color=shade, fill=shade)
-        except Exception: pass
+        except Exception:
+            pass
 
     def _update_transport(self, snap):
         playing = snap["is_playing"]
@@ -885,32 +1040,63 @@ class PhantomUI:
 
         x = int((pos / dur) * 688) if dur > 0 else 0
         try:
-            dpg.delete_item("tl_fill"); dpg.delete_item("tl_head")
-            dpg.draw_rectangle((0,0),(x,20), color=C["amber_dim"],
+            dpg.delete_item("tl_fill")
+            dpg.delete_item("tl_head")
+            dpg.draw_rectangle((0, 0), (x, 20), color=C["amber_dim"],
                                fill=C["amber_faint"],
                                parent="timeline_draw", tag="tl_fill")
-            dpg.draw_line((x,0),(x,20), color=C["amber"],
+            dpg.draw_line((x, 0), (x, 20), color=C["amber"],
                           parent="timeline_draw", tag="tl_head")
-        except Exception: pass
+        except Exception:
+            pass
 
         try:
             dpg.delete_item("tl_markers", children_only=True)
             dpg.delete_item("tl_markers")
-        except Exception: pass
+        except Exception:
+            pass
         if dur > 0:
             try:
                 with dpg.draw_node(parent="timeline_draw", tag="tl_markers"):
                     for m in snap.get("markers", []):
                         mx = int((m / dur) * 688)
-                        dpg.draw_line((mx,0),(mx,20),
+                        dpg.draw_line((mx, 0), (mx, 20),
                                       color=C["blue"], thickness=2)
-            except Exception: pass
+            except Exception:
+                pass
 
-    def _update_gesture(self, snap):
+    # ── Camera / gesture update (flicker-free) ────────────────────────────────
+    def _upload_camera_frame(self, frame_bgr: np.ndarray):
+        """
+        Convert a BGR numpy frame to an RGBA float32 texture upload.
+
+        Key fix for the flashing bug:
+        - We reuse self._cam_buf (no per-frame allocation).
+        - cv2.resize + cv2.cvtColor write into the existing buffer in one shot.
+        - dpg.set_value replaces the texture contents atomically — DPG never
+          sees a blank frame because we never delete and re-create the texture.
+        - Upload is skipped on ticks where _tick % _CAM_UPLOAD_EVERY != 0.
+        """
+        if self._tick % self._CAM_UPLOAD_EVERY != 0:
+            return
+        try:
+            resized = cv2.resize(frame_bgr, (self._cam_w, self._cam_h))
+            rgba    = cv2.cvtColor(resized, cv2.COLOR_BGR2RGBA)
+            # Write float32 values into pre-allocated buffer
+            np.copyto(self._cam_buf,
+                      rgba.astype(np.float32) * (1.0 / 255.0))
+            dpg.set_value("cam_texture", self._cam_buf.flatten().tolist())
+        except Exception:
+            pass
+
+    def _update_gesture(self, snap: dict):
+        # ── Camera feed ───────────────────────────────────────────────────────
         with self.state._lock:
             frame = self.state.latest_frame
         if frame is not None:
-            self.update_camera_frame(frame)
+            self._upload_camera_frame(frame)
+
+        # ── Gesture text — only reconfigure when value actually changes ────────
         name   = snap["gesture_name"]
         conf   = snap["gesture_confidence"]
         hold   = snap["gesture_hold_frames"]
@@ -920,23 +1106,19 @@ class PhantomUI:
         cmd    = snap["last_command"]
 
         icon  = GESTURE_ICONS.get(name, "[ ]")
-        gcol  = (C["green"] if name == "PLAY"
+        gcol  = (C["green"]    if name == "PLAY"
                  else C["blue"] if name == "PAUSE"
                  else C["text_dim"])
-        try:
-            dpg.delete_item("gest_icon_draw")
-            dpg.delete_item("gest_name_draw")
-            dpg.delete_item("gest_conf_draw")
-            dpg.draw_text((48,12), icon, parent="gesture_draw",
-                          tag="gest_icon_draw", color=gcol, size=36)
-            dpg.draw_text((max(4, 90 - len(name)*4), 72), name,
-                          parent="gesture_draw",
-                          tag="gest_name_draw", color=gcol, size=13)
-            dpg.draw_text((130,96),
-                          f"{conf:.0%}" if active else "—",
-                          parent="gesture_draw",
-                          tag="gest_conf_draw", color=C["text_dim"], size=11)
-        except Exception: pass
+
+        if name != self._last_gesture or gcol != self._last_gesture_col:
+            # Update text items in-place — no delete/redraw, no flash
+            dpg.configure_item("gest_icon", default_value=icon,   color=gcol)
+            dpg.configure_item("gest_name", default_value=name,   color=gcol)
+            dpg.configure_item("gest_conf",
+                               default_value=f"{conf:.0%}" if active else "—",
+                               color=C["text_dim"])
+            self._last_gesture     = name
+            self._last_gesture_col = gcol
 
         dpg.set_value("hold_bar", min(1.0, hold / max(1, target)))
         dpg.configure_item("hold_bar", overlay=f"{hold} / {target}")
@@ -964,14 +1146,16 @@ class PhantomUI:
             dpg.set_value("q_bpm_hint",
                           "" if self._queue_sel >= 0
                           else "← select a row, then SET BPM")
-        except Exception: pass
+        except Exception:
+            pass
 
     def _force_queue_redraw(self):
         self._last_queue_sig = (-1, -1, -1, -1)
 
     def _refresh_queue_table(self, tracks, current_idx):
+        # Tear down the old table (if any) and the empty label
         try:
-            dpg.delete_item("queue_list", children_only=True)
+            dpg.delete_item("queue_table")
         except Exception:
             pass
         try:
@@ -980,39 +1164,67 @@ class PhantomUI:
         except Exception:
             pass
 
-        for i, t in enumerate(tracks):
-            is_cur  = (i == current_idx)
-            is_sel  = (i == self._queue_sel)
-            bpm     = t.get("bpm")
-            bpm_str = f"{bpm:.0f}" if bpm is not None else "??"
-            dur     = t.get("duration", 0.0)
-            dur_str = f"{int(dur)//60}:{int(dur)%60:02d}" if dur else "—"
+        if not tracks:
+            return
 
-            row_col  = (C["amber"] if is_cur
-                        else C["white"] if is_sel
-                        else C["text_dim"])
-            prefix   = "▶ " if is_cur else f"{i+1:>2}."
-            name_col = t["name"][:38].ljust(38)
-            bpm_col  = bpm_str.ljust(7)
-            label    = f"{prefix}  {name_col}  {bpm_col}  {dur_str}"
+        # Build a fresh table inside the scroll window
+        with dpg.table(
+            tag="queue_table",
+            parent="queue_list_outer",
+            header_row=True,
+            borders_innerV=True,
+            borders_outerV=False,
+            borders_outerH=False,
+            row_background=False,
+            resizable=True,
+            policy=dpg.mvTable_SizingFixedFit,
+            width=-1,
+        ):
+            dpg.add_table_column(label="#",        init_width_or_weight=28)
+            dpg.add_table_column(label="File",     init_width_or_weight=260,
+                                 width_stretch=True)
+            dpg.add_table_column(label="BPM",      init_width_or_weight=52)
+            dpg.add_table_column(label="Duration", init_width_or_weight=60)
 
-            sel = dpg.add_selectable(
-                label=label,
-                default_value=is_sel,
-                callback=self._cb_q_row,
-                user_data=i,
-                width=-1,
-                parent="queue_list",
-            )
-            with dpg.theme() as rt:
-                with dpg.theme_component(dpg.mvSelectable):
-                    dpg.add_theme_color(dpg.mvThemeCol_Text, row_col)
-                    if is_sel:
-                        dpg.add_theme_color(dpg.mvThemeCol_Header, C["select"])
-            dpg.bind_item_theme(sel, rt)
+            for i, t in enumerate(tracks):
+                is_cur  = (i == current_idx)
+                is_sel  = (i == self._queue_sel)
+                bpm     = t.get("bpm")
+                bpm_str = f"{bpm:.0f}" if bpm is not None else "??"
+                dur     = t.get("duration", 0.0)
+                dur_str = f"{int(dur)//60}:{int(dur)%60:02d}" if dur else "—"
+                row_col = (C["amber"] if is_cur
+                           else C["white"] if is_sel
+                           else C["text_dim"])
+                prefix  = "▶" if is_cur else f"{i+1}"
+
+                with dpg.table_row():
+                    # Column 0 — index / playing indicator
+                    dpg.add_text(prefix, color=row_col)
+
+                    # Column 1 — filename as a selectable spanning the cell
+                    sel = dpg.add_selectable(
+                        label=t["name"],
+                        default_value=is_sel,
+                        callback=self._cb_q_row,
+                        user_data=i,
+                        span_columns=False,
+                    )
+                    with dpg.theme() as rt:
+                        with dpg.theme_component(dpg.mvSelectable):
+                            dpg.add_theme_color(dpg.mvThemeCol_Text,   row_col)
+                            dpg.add_theme_color(dpg.mvThemeCol_Header, C["select"])
+                    dpg.bind_item_theme(sel, rt)
+
+                    # Column 2 — BPM
+                    dpg.add_text(bpm_str, color=row_col)
+
+                    # Column 3 — duration
+                    dpg.add_text(dur_str, color=C["text_dim"])
 
     def _update_log(self):
-        if self._tick % 6 != 0: return
+        if self._tick % 6 != 0:
+            return
         lines = self.logger.lines(80)
         dpg.set_value("log_text",
                       "\n".join(f"[{ts}] [{lvl.upper():4s}] {msg}"

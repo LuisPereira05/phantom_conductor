@@ -1,3 +1,4 @@
 hagrid/
 venv/
 audio/*
+__pycache__/

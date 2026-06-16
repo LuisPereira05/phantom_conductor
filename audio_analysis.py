@@ -13,10 +13,13 @@ DSP chain
     → full autocorrelation
     → parabolic peak interpolation
     → octave correction  (½× / 1× / 2× closest to previous)
-    → exponential smoothing (α = SMOOTH_ALPHA)
+    → exponential smoothing (α = CFG.smooth_alpha)
     → STATE.set_bpm()
 
-Nothing in this file touches sounddevice, OpenCV, or the UI.
+Changes from v0.5.0
+--------------------
+* MIN_BPM, MAX_BPM, SMOOTH_ALPHA, ANALYZE_EVERY now read from CFG so
+  that the Settings panel can override them at runtime.
 """
 
 import time
@@ -25,16 +28,13 @@ import librosa
 from scipy.signal import butter, lfilter
 
 from buffers import audio_buffer, SR
+from config  import CFG
 from state   import PhantomState
 from logger  import Logger
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-HOP_LENGTH    = 256
-MIN_BPM       = 60
-MAX_BPM       = 200
-SMOOTH_ALPHA  = 0.3
-BANDPASS      = (40, 3000)
-ANALYZE_EVERY = 0.25          # seconds between analysis passes
+HOP_LENGTH = 256
+BANDPASS   = (40, 3000)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -61,8 +61,8 @@ def _pick_peak(ac: np.ndarray, lag_min: int, lag_max: int) -> float | None:
         return None
     i = lag_min + int(np.argmax(seg))
     if 0 < i < len(ac) - 1:
-        y0, y1, y2 = ac[i-1], ac[i], ac[i+1]
-        d = y0 - 2*y1 + y2
+        y0, y1, y2 = ac[i - 1], ac[i], ac[i + 1]
+        d = y0 - 2 * y1 + y2
         if d:
             return i + 0.5 * (y0 - y2) / d
     return float(i)
@@ -71,7 +71,7 @@ def _pick_peak(ac: np.ndarray, lag_min: int, lag_max: int) -> float | None:
 def _octave_correct(bpm: float, prev: float | None) -> float:
     if prev is None or not np.isfinite(prev):
         return bpm
-    return min([bpm/2, bpm, bpm*2], key=lambda x: abs(x - prev))
+    return min([bpm / 2, bpm, bpm * 2], key=lambda x: abs(x - prev))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -88,6 +88,10 @@ def estimate_bpm(y: np.ndarray, sr: int = SR,
     (bpm_smoothed, debug_dict)
     bpm_smoothed is None when the buffer is too short or too quiet.
     """
+    min_bpm      = CFG.min_bpm
+    max_bpm      = CFG.max_bpm
+    smooth_alpha = CFG.smooth_alpha
+
     if len(y) < sr * 2:
         return None, {"msg": "buffer too short"}
 
@@ -103,8 +107,8 @@ def estimate_bpm(y: np.ndarray, sr: int = SR,
         return None, {"msg": "weak onset"}
 
     ac      = np.correlate(onset, onset, mode="full")[len(onset) - 1:]
-    lag_min = max(2, int(np.floor(60 * sr / (MAX_BPM * HOP_LENGTH))))
-    lag_max = min(int(np.ceil(60 * sr / (MIN_BPM * HOP_LENGTH))), len(ac) - 1)
+    lag_min = max(2, int(np.floor(60 * sr / (max_bpm * HOP_LENGTH))))
+    lag_max = min(int(np.ceil(60 * sr / (min_bpm * HOP_LENGTH))), len(ac) - 1)
 
     if lag_min >= lag_max:
         return None, {"msg": "invalid range"}
@@ -114,12 +118,13 @@ def estimate_bpm(y: np.ndarray, sr: int = SR,
         return None, {"msg": "invalid lag"}
 
     bpm_raw  = 60.0 * sr / (HOP_LENGTH * lag)
-    bpm_corr = float(np.clip(_octave_correct(bpm_raw, bpm_prev), MIN_BPM, MAX_BPM))
+    bpm_corr = float(np.clip(_octave_correct(bpm_raw, bpm_prev),
+                             min_bpm, max_bpm))
 
     if bpm_prev is None or not np.isfinite(bpm_prev):
         bpm_s = bpm_corr
     elif abs(bpm_corr - bpm_prev) < 5.0:
-        bpm_s = SMOOTH_ALPHA * bpm_corr + (1 - SMOOTH_ALPHA) * bpm_prev
+        bpm_s = smooth_alpha * bpm_corr + (1 - smooth_alpha) * bpm_prev
     else:
         bpm_s = bpm_corr
 
@@ -136,14 +141,15 @@ def estimate_bpm(y: np.ndarray, sr: int = SR,
 
 def bpm_analysis_thread(state: PhantomState, logger: Logger):
     """
-    Runs in a daemon thread.  Every ANALYZE_EVERY seconds it copies the
+    Runs in a daemon thread.  Every CFG.analyze_every seconds it copies the
     current contents of audio_buffer and runs estimate_bpm(), writing the
     result to state.  Also updates state.buffer_fill.
     """
     last = 0.0
     while state.alive():
+        analyze_every = CFG.analyze_every
         now = time.time()
-        if now - last >= ANALYZE_EVERY and len(audio_buffer) >= SR * 2:
+        if now - last >= analyze_every and len(audio_buffer) >= SR * 2:
             last = now
             y = np.array(audio_buffer, dtype=np.float32)
             bpm_new, dbg = estimate_bpm(y, bpm_prev=state.get_bpm())
@@ -158,4 +164,4 @@ def bpm_analysis_thread(state: PhantomState, logger: Logger):
             with state._lock:
                 state.buffer_fill = min(
                     1.0, len(audio_buffer) / (SR * 10))   # 10 s == full
-        time.sleep(ANALYZE_EVERY / 4)
+        time.sleep(analyze_every / 4)

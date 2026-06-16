@@ -14,10 +14,17 @@ Thread map
                       (internally uses video_input helpers)
 
 Main thread → ui.PhantomUI.run()  (Dear PyGui must run on the main thread)
+
+Changes from v0.5.0
+--------------------
+* Camera index now read from CFG (phantom_config.json) by default.
+  Command-line override still works: `python main.py 2`
+* Introduces config.py and tracklist.py as new dependencies.
 """
 
 import threading
 
+from config              import CFG
 from state               import PhantomState
 from logger              import Logger
 from audio_analysis      import bpm_analysis_thread
@@ -29,14 +36,24 @@ from ui                  import PhantomUI
 
 def main():
     print("=" * 58)
-    print("  PHANTOM CONDUCTOR v0.5.0")
+    print("  PHANTOM CONDUCTOR v0.5.1")
     print("=" * 58)
-    print("  Camera index to use? (Enter = 0):", end=" ", flush=True)
+
+    # Camera index: CLI arg overrides saved config
+    cam_prompt = (
+        f"  Camera index to use? (Enter = {CFG.cam_index}): "
+    )
+    print(cam_prompt, end="", flush=True)
     cam_str = input().strip()
-    cam_idx = int(cam_str) if cam_str.isdigit() else 0
+    if cam_str.isdigit():
+        cam_idx = int(cam_str)
+        CFG.set("cam_index", cam_idx)
+    else:
+        cam_idx = CFG.cam_index
+
     print()
     print("  → Add tracks via the Queue panel (+ADD)")
-    print("  → Select I/O devices in the AUDIO I/O panel, then click APPLY")
+    print("  → Configure audio/video in the SETTINGS panel, then click APPLY")
     print("  → Open hand = PLAY  |  Fist = PAUSE  |  Space = toggle  |  Q = quit")
     print("=" * 58 + "\n")
 
