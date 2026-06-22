@@ -1,6 +1,6 @@
 {
-  "dev_in": 12,
-  "dev_out": 12,
+  "dev_in": 5,
+  "dev_out": 11,
   "input_gain": 1.7599999904632568,
   "output_gain": 0.8500000238418579,
   "cam_index": 0,
@@ -13,7 +13,7 @@
   "gesture_hold_frames": 8,
   "use_pedal": false,
   "pedal_key": "space",
-  "use_tempo_tapper": false,
+  "use_tempo_tapper": true,
   "tap_key": "t",
   "smooth_alpha": 0.3,
   "min_bpm": 60,
