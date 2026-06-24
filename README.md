@@ -14,7 +14,43 @@ pip install dearpygui mutagen sounddevice
 
 ---
 
-## Architecture
+## Project layout
+
+```
+phantom_conductor/
+├─ main.py                  — entry point; starts all threads, then dpg.run()
+│
+├─ state.py                 — shared thread-safe state + track queue
+├─ config.py                — settings, persisted to phantom_config.json
+├─ buffers.py                — shared ring buffer / queue singletons
+├─ logger.py                — thread-safe ring-buffer logger
+│
+├─ audio_input.py           — mic/speaker I/O (sounddevice)
+├─ audio_analysis.py        — BPM detection DSP chain
+├─ audio_processing.py      — track loading + beat-synced playback
+├─ tempo_tapper.py          — Arduino foot-tapper serial bridge
+│
+├─ video_input.py           — OpenCV camera + MediaPipe HandLandmarker
+├─ gesture_recognition.py   — gesture classification + HUD overlay
+├─ gesture_trainer.py       — custom gesture feature extraction/matching
+├─ gesture_train_ui.py      — Dear PyGui training workflow mixin
+│
+├─ track_queue.py           — in-memory TrackQueue
+├─ tracklist.py             — TrackQueue + JSON persistence
+├─ ui.py                    — Dear PyGui dashboard (main thread)
+│
+├─ audio/                   — track library
+├─ hand_landmarker.task     — MediaPipe model (auto-downloaded if missing)
+├─ requirements.txt
+│
+├─ phantom_config.json      — CFG persistence (config.py)
+├─ tracklist.json           — track queue persistence (tracklist.py)
+├─ gesture_pool.bin         — trained gesture vectors (gesture_trainer.py)
+├─ gesture_pool.meta.json   — gesture names/commands sidecar
+└─ gesture_templates.json   — legacy gesture format, migrated on first load
+```
+
+## Thread map
 
 ```
 main.py

@@ -24,7 +24,7 @@ from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
 
 from logger import Logger
 
-import cv2, sys
+import sys
 cam = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 cap = cv2.VideoCapture(cam, cv2.CAP_V4L2)  # or CAP_DSHOW on Windows
 print("opened:", cap.isOpened())

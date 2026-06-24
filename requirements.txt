@@ -1,0 +1,10 @@
+dearpygui
+librosa
+mediapipe
+mutagen
+numpy
+opencv-python
+pyrubberband
+pyserial
+scipy
+sounddevice
