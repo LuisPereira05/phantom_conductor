@@ -1,0 +1,30 @@
+[
+  {
+    "name": "THUMBS_UP",
+    "command": "prev",
+    "clips": 3,
+    "frames": 1256,
+    "needs_retrain": false
+  },
+  {
+    "name": "OPEN_HAND",
+    "command": "play",
+    "clips": 3,
+    "frames": 971,
+    "needs_retrain": false
+  },
+  {
+    "name": "FIST",
+    "command": "pause",
+    "clips": 3,
+    "frames": 831,
+    "needs_retrain": false
+  },
+  {
+    "name": "INDEX",
+    "command": "next",
+    "clips": 3,
+    "frames": 750,
+    "needs_retrain": false
+  }
+]
