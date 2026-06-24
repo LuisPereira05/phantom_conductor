@@ -2,3 +2,4 @@ hagrid/
 venv/
 audio/*
 __pycache__/
+*.task
