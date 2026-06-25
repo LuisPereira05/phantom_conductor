@@ -1,14 +1,8 @@
 [
   {
     "name": "Owner of a Lonely Heart (2008 Remaster) [TubeRipper.cc].wav",
-    "path": "audio/Owner of a Lonely Heart (2008 Remaster) [TubeRipper.cc].wav",
+    "path": "audio\\Owner of a Lonely Heart (2008 Remaster) [TubeRipper.cc].wav",
     "bpm": 125.0,
     "duration": 0.0
-  },
-  {
-    "name": "Audioslave - Doesn't Remind Me (HQ).mp3",
-    "path": "../../../../../home/saturnino/Desktop/YT-MP3/output/Audioslave - Doesn't Remind Me (HQ).mp3",
-    "bpm": 99.0,
-    "duration": 256.344
   }
 ]

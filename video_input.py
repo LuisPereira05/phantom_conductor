@@ -15,31 +15,34 @@ All drawing lives in gesture_recognition.py.
 """
 
 import os
+import sys
 import urllib.request
+
 import cv2
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
 
-from logger import Logger
+_IS_WINDOWS = sys.platform == "win32"
+_IS_LINUX = sys.platform.startswith("linux")
 
-import sys
-cam = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-cap = cv2.VideoCapture(cam, cv2.CAP_V4L2)  # or CAP_DSHOW on Windows
-print("opened:", cap.isOpened())
-ret, frame = cap.read()
-print("read:", ret, "shape:", frame.shape if ret else None)
-cap.release()
+# Camera backend
+CAM_BACKEND = cv2.CAP_DSHOW if _IS_WINDOWS else cv2.CAP_V4L2
+
+# CAP_PROP_BUFFERSIZE is only honoured by V4L2 (Linux); silently ignored elsewhere
+CAM_BUFFERSIZE_SUPPORTED = _IS_LINUX
+
+from logger import Logger
 
 # ── MediaPipe model ────────────────────────────────────────────────────────────
 MODEL_PATH = "hand_landmarker.task"
-MODEL_URL  = (
+MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
     "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
 )
 
-FRAME_W = 640   # match what your camera actually supports
+FRAME_W = 640
 FRAME_H = 480
 
 
@@ -57,16 +60,21 @@ def download_model(logger: Logger):
 
 
 def open_camera(cam_idx: int, logger: Logger) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(cam_idx)
+    cap = cv2.VideoCapture(cam_idx, CAM_BACKEND)
+    if CAM_BUFFERSIZE_SUPPORTED:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera {cam_idx}")
-    
-    # Request resolution and log what we actually got
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
+
+    # Reduce internal buffer to 1 frame so we always get the freshest image.
+    # The default (3-4 frames) means gesture reads can lag 100+ ms behind reality.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    logger.ok(f"Camera {cam_idx} open: {actual_w}x{actual_h}")  # ASCII x, not *
+    logger.ok(f"Camera {cam_idx} open: {actual_w}x{actual_h}")
     return cap
 
 
@@ -82,7 +90,7 @@ def read_frame(cap: cv2.VideoCapture):
     ret, frame = cap.read()
     if not ret:
         return None, None
-    frame  = cv2.flip(frame, 1)
+    frame = cv2.flip(frame, 1)
     mp_img = mp.Image(
         image_format=mp.ImageFormat.SRGB,
         data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
@@ -94,7 +102,6 @@ def make_landmarker() -> HandLandmarker:
     """
     Create and return a HandLandmarker configured for single-image mode.
     Use as a context manager:
-
         with make_landmarker() as detector:
             result = detector.detect(mp_image)
     """
@@ -107,3 +114,17 @@ def make_landmarker() -> HandLandmarker:
         min_tracking_confidence=0.55,
     )
     return HandLandmarker.create_from_options(options)
+
+
+# ── Dev / diagnostics ──────────────────────────────────────────────────────────
+# Guarded so that importing this module never triggers a camera open or reads
+# sys.argv — previously this ran at module level and would fire on every import.
+if __name__ == "__main__":
+    import sys
+
+    cam = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    cap = cv2.VideoCapture(cam, CAM_BACKEND)
+    print("opened:", cap.isOpened())
+    ret, frame = cap.read()
+    print("read:", ret, "shape:", frame.shape if ret else None)
+    cap.release()

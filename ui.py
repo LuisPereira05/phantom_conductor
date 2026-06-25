@@ -648,6 +648,19 @@ class PhantomUI(GestureTrainUI):
                 dpg.add_text("(restart required to take effect)", color=C["text_dim"])
 
             dpg.add_spacer(height=6)
+            dpg.add_checkbox(
+                label="Skip frames (inference)",
+                callback=lambda s, a: CFG.set("inference_skip_enabled", a),
+                default_value=CFG.inference_skip_enabled,
+            )
+            dpg.add_slider_int(
+                label="Run every N frames",
+                min_value=1,
+                max_value=6,
+                default_value=CFG.inference_skip_frames,
+                callback=lambda s, a: CFG.set("inference_skip_frames", a),
+            )
+            dpg.add_spacer(height=6)
 
             # ── Row 4: Gesture command mapper ─────────────────────────────────
             _ALL_CMDS = [
@@ -928,7 +941,49 @@ class PhantomUI(GestureTrainUI):
                 dpg.bind_item_theme("btn_clr_log", self._th_amb)
             dpg.add_separator()
             with dpg.child_window(tag="log_scroll", height=-1, border=False):
-                dpg.add_text("", tag="log_text", color=C["text_dim"], wrap=1350)
+                with dpg.theme() as _log_input_theme:
+                    with dpg.theme_component(dpg.mvInputText):
+                        dpg.add_theme_color(
+                            dpg.mvThemeCol_FrameBg,
+                            C["panel"],
+                            category=dpg.mvThemeCat_Core,
+                        )
+                        dpg.add_theme_color(
+                            dpg.mvThemeCol_FrameBgHovered,
+                            C["panel"],
+                            category=dpg.mvThemeCat_Core,
+                        )
+                        dpg.add_theme_color(
+                            dpg.mvThemeCol_FrameBgActive,
+                            C["panel"],
+                            category=dpg.mvThemeCat_Core,
+                        )
+                        dpg.add_theme_color(
+                            dpg.mvThemeCol_Border,
+                            (0, 0, 0, 0),
+                            category=dpg.mvThemeCat_Core,
+                        )
+                        dpg.add_theme_color(
+                            dpg.mvThemeCol_Text,
+                            C["text_dim"],
+                            category=dpg.mvThemeCat_Core,
+                        )
+                        dpg.add_theme_style(
+                            dpg.mvStyleVar_FramePadding,
+                            0,
+                            0,
+                            category=dpg.mvThemeCat_Core,
+                        )
+                dpg.add_input_text(
+                    tag="log_text",
+                    default_value="",
+                    multiline=True,
+                    readonly=True,
+                    width=-1,
+                    height=-1,
+                    tab_input=False,
+                )
+                dpg.bind_item_theme("log_text", _log_input_theme)
 
     # ═════════════════════════════════════════════════════════════════════════
     #  CALLBACKS

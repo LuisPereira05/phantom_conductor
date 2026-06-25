@@ -1,7 +1,7 @@
 {
-  "dev_in": 5,
-  "dev_out": 12,
-  "input_gain": 1.7599999904632568,
+  "dev_in": 0,
+  "dev_out": 2,
+  "input_gain": 0.9900000095367432,
   "output_gain": 0.8500000238418579,
   "cam_index": 0,
   "gesture_map": {
@@ -11,9 +11,11 @@
     "PEACE": "loop_toggle"
   },
   "gesture_hold_frames": 8,
+  "inference_skip_enabled": true,
+  "inference_skip_frames": 2,
   "use_pedal": false,
   "pedal_key": "space",
-  "use_tempo_tapper": true,
+  "use_tempo_tapper": false,
   "tap_key": "t",
   "smooth_alpha": 0.3,
   "min_bpm": 60,

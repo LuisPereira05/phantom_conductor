@@ -16,35 +16,33 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "phantom_config.json")
 
 _DEFAULTS: dict = {
     # ── Audio I/O ─────────────────────────────────────────────────────────────
-    "dev_in":          None,      # sounddevice device index (None = system default)
-    "dev_out":         None,
-    "input_gain":      1.0,       # mic pre-gain applied before ring buffer
-    "output_gain":     0.85,      # backing-track output gain
-
+    "dev_in": None,  # sounddevice device index (None = system default)
+    "dev_out": None,
+    "input_gain": 1.0,  # mic pre-gain applied before ring buffer
+    "output_gain": 0.85,  # backing-track output gain
     # ── Video ─────────────────────────────────────────────────────────────────
-    "cam_index":       0,         # OpenCV camera index
-
+    "cam_index": 0,  # OpenCV camera index
     # ── Gesture / hand command mapper ─────────────────────────────────────────
     # Maps gesture name → transport command
     "gesture_map": {
-        "PLAY":  "play",
+        "PLAY": "play",
         "PAUSE": "pause",
     },
-    "gesture_hold_frames": 8,     # frames a gesture must be held before firing
-
+    "gesture_hold_frames": 8,  # frames a gesture must be held before firing
+    # ── Inference ─────────────────────────────────────────────────────────────
+    "inference_skip_enabled": False,
+    "inference_skip_frames": 2,
     # ── Pedal ─────────────────────────────────────────────────────────────────
-    "use_pedal":        False,
-    "pedal_key":        "space",  # keyboard key that simulates pedal press
-
+    "use_pedal": False,
+    "pedal_key": "space",  # keyboard key that simulates pedal press
     # ── Tempo tapper ──────────────────────────────────────────────────────────
     "use_tempo_tapper": False,
-    "tap_key":          "t",      # keyboard key for tap-tempo
-
+    "tap_key": "t",  # keyboard key for tap-tempo
     # ── BPM analysis ──────────────────────────────────────────────────────────
-    "smooth_alpha":    0.3,
-    "min_bpm":         60,
-    "max_bpm":         200,
-    "analyze_every":   0.25,      # seconds between analysis passes
+    "smooth_alpha": 0.3,
+    "min_bpm": 60,
+    "max_bpm": 200,
+    "analyze_every": 0.25,  # seconds between analysis passes
 }
 
 

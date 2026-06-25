@@ -37,6 +37,11 @@ POINT  — index only  (1 finger)    default → "next"
 PEACE  — V / peace   (2 fingers)   default → "loop_toggle"
 """
 
+# gesture_recognition.py
+import ctypes
+import os
+import queue
+import threading
 import time
 from collections import Counter, deque
 
@@ -87,7 +92,7 @@ PLAY_COLOR = (50, 200, 50)
 PAUSE_COLOR = (50, 50, 220)
 POINT_COLOR = (220, 160, 50)
 PEACE_COLOR = (160, 80, 220)
-CUSTOM_COLOR = (50, 210, 210)  # cyan for trained gestures
+CUSTOM_COLOR = (50, 210, 210)
 NONE_COLOR = (180, 180, 180)
 
 BUILTIN_COLORS = {
@@ -99,14 +104,74 @@ BUILTIN_COLORS = {
 
 MIN_HOLD = 8
 
+# ── Reusable landmark buffer (avoids a 21×3 allocation every frame) ───────────
+# One buffer per thread — the classify stage is the only consumer so a single
+# module-level buffer is safe (no concurrent writers).
+_LM_BUF = np.empty((21, 3), dtype=np.float32)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  RULE-BASED CLASSIFIER  (fallback when no custom template matches)
+#  THREAD PRIORITY HELPER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _try_set_nice(level: int = -10) -> None:
+    """
+    Lower the niceness of the calling thread so audio threads get more CPU.
+    Requires CAP_SYS_NICE (or running as root) — silently no-ops otherwise.
+    Only effective on Linux; harmless to call on other platforms.
+    """
+    try:
+        os.nice(level)
+    except (OSError, AttributeError):
+        pass
+
+
+def _try_set_realtime(priority: int = 10) -> None:
+    import sys
+
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.kernel32.SetThreadPriority(
+                ctypes.windll.kernel32.GetCurrentThread(),
+                2,  # THREAD_PRIORITY_HIGHEST
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+            class _SchedParam(ctypes.Structure):
+                _fields_ = [("sched_priority", ctypes.c_int)]
+
+            param = _SchedParam(priority)
+            SCHED_FIFO = 1
+            ret = libc.sched_setscheduler(0, SCHED_FIFO, ctypes.byref(param))
+            if ret != 0:
+                _try_set_nice(-10)
+        except Exception:
+            _try_set_nice(-10)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RULE-BASED CLASSIFIER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _lm_arr(lm_list) -> np.ndarray:
-    return np.array([[p.x, p.y, p.z] for p in lm_list])
+    """
+    Write landmark positions into the pre-allocated module-level buffer and
+    return it.  Avoids a fresh 21×3 heap allocation on every frame.
+
+    The caller must not hold a reference across frames — the same array is
+    overwritten each call.  If you need to keep a snapshot, call .copy().
+    """
+    for i, p in enumerate(lm_list):
+        _LM_BUF[i, 0] = p.x
+        _LM_BUF[i, 1] = p.y
+        _LM_BUF[i, 2] = p.z
+    return _LM_BUF
 
 
 def _finger_up(lm: np.ndarray, tip: int, pip: int) -> bool:
@@ -173,8 +238,6 @@ def classify_with_trainer(
     Returns
     -------
     (gesture_name, is_custom, match_distance)
-    is_custom=True  → name came from a trained template
-    is_custom=False → name came from rule-based classifier (dist=0.0)
     """
     custom_name, dist = TRAINER.match(lm)
     if custom_name is not None:
@@ -243,14 +306,12 @@ def _draw_hud(
     tw = cv2.getTextSize(fps_str, FS, 0.5, 1)[0][0]
     _shadow_text(frame, fps_str, (w - tw - 12, 34), FS, 0.5, (80, 255, 120))
 
-    # Recording banner
     if recording:
         banner = f"● REC  {sample_count} frames captured"
         _draw_rect_alpha(frame, 0, 52, w, 90, (60, 10, 10))
         btw = cv2.getTextSize(banner, F, 0.7, 2)[0][0]
         _shadow_text(frame, banner, ((w - btw) // 2, 78), F, 0.7, (80, 80, 255), 2)
 
-    # Status panel
     px, py = 12, h - 160
     _draw_rect_alpha(frame, px, py, px + 360, py + 145, (10, 10, 10))
     state_str = "PLAY" if playing else "PAUSE"
@@ -315,14 +376,88 @@ def _draw_hud(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  GESTURE VISION THREAD
+#  THREE-STAGE PIPELINE THREADS
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  Stage 1 — _capture_thread   : cap.read() → frame_q
+#  Stage 2 — _inference_thread : mediapipe detect() → result_q
+#  Stage 3 — gesture_vision_thread (public) : classify + HUD draw + imshow
+#
+#  Both queues use maxsize=1 ("drop queue"): when a downstream stage is busy
+#  the upstream stage discards the stale frame rather than building a backlog.
+#  This keeps MediaPipe latency from cascading into audio thread starvation.
+
+
+def _capture_thread(
+    cap: cv2.VideoCapture,
+    frame_q: queue.Queue,
+    state: PhantomState,
+    logger: Logger,
+) -> None:
+    """
+    Stage 1: pure I/O — reads camera frames and forwards them downstream.
+    Intentionally lightweight so it never blocks the inference stage.
+    """
+    while state.alive():
+        frame, mp_img = read_frame(cap)
+        if frame is None:
+            logger.err("capture: frame read failed — exiting")
+            state.stop()
+            break
+
+        # Share the latest raw frame for the DPG texture upload path
+        with state._lock:
+            state.latest_frame = cv2.resize(
+                frame, (320, 240), interpolation=cv2.INTER_NEAREST
+            )
+
+        try:
+            frame_q.put_nowait((frame, mp_img))
+        except queue.Full:
+            pass  # inference still busy — drop this frame, not a problem
+
+
+def _inference_thread(
+    frame_q: queue.Queue,
+    result_q: queue.Queue,
+    state: PhantomState,
+    logger: Logger,
+) -> None:
+    logger.ok("HandLandmarker loaded")
+    skip_counter = 0
+    with make_landmarker() as detector:
+        while state.alive():
+            try:
+                frame, mp_img = frame_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if CFG.inference_skip_enabled:
+                skip_counter += 1
+                if skip_counter % CFG.inference_skip_frames != 0:
+                    continue  # drop frame, reuse last result downstream
+
+            result = detector.detect(mp_img)
+
+            try:
+                result_q.put_nowait((frame, result))
+            except queue.Full:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PUBLIC ENTRY POINT  (replaces the original monolithic thread)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 def gesture_vision_thread(cam_idx: int, state: PhantomState, logger: Logger):
     """
-    Full gesture pipeline in a daemon thread.
-    Reads state.capture_sample_requested each frame to service the trainer UI.
+    Orchestrates the three-stage gesture pipeline as daemon threads, then runs
+    the classify + HUD-draw + imshow loop on *this* thread (Stage 3).
+
+    Stage 1 (capture) and Stage 2 (inference) run as daemon threads started
+    here.  They share drop-queues (maxsize=1) so a slow MediaPipe pass never
+    backs up camera I/O or blocks audio threads waiting on the GIL.
     """
     download_model(logger)
 
@@ -332,8 +467,27 @@ def gesture_vision_thread(cam_idx: int, state: PhantomState, logger: Logger):
         logger.err(f"vision: {e}")
         return
 
-    logger.ok("HandLandmarker loaded")
+    # Drop queues — maxsize=1 means the faster stage discards stale data
+    # rather than accumulating a growing backlog.
+    frame_q: queue.Queue = queue.Queue(maxsize=1)
+    result_q: queue.Queue = queue.Queue(maxsize=1)
 
+    t_capture = threading.Thread(
+        target=_capture_thread,
+        args=(cap, frame_q, state, logger),
+        name="gesture-capture",
+        daemon=True,
+    )
+    t_inference = threading.Thread(
+        target=_inference_thread,
+        args=(frame_q, result_q, state, logger),
+        name="gesture-inference",
+        daemon=True,
+    )
+    t_capture.start()
+    t_inference.start()
+
+    # ── Stage 3: classify + draw (this thread) ────────────────────────────────
     stab = GestureStabilizer(window=10)
     prev_stable = None
     prev_time = time.time()
@@ -341,131 +495,12 @@ def gesture_vision_thread(cam_idx: int, state: PhantomState, logger: Logger):
     pending = None
     last_lm = None
 
-    with make_landmarker() as detector:
-        while state.alive():
-            frame, mp_img = read_frame(cap)
-            if frame is None:
-                logger.err("vision: frame read failed")
-                break
-
-            with state._lock:
-                state.latest_frame = frame
-
-            h_f, w_f = frame.shape[:2]
-            now = time.time()
-            fps = 1.0 / max(now - prev_time, 1e-9)
-            prev_time = now
-
-            # ── Trainer capture latch ─────────────────────────────────────────
-            if getattr(state, "clip_recording_active", False):
-                if last_lm is not None and TRAINER.is_recording():
-                    TRAINER.capture_frame(last_lm)
-                # no warn here — it's fine if no hand is in frame mid-clip
-
-            # ── MediaPipe detection ───────────────────────────────────────────
-            result = detector.detect(mp_img)
-            raw_gesture = None
-            is_custom = False
-
-            if result.hand_landmarks:
-                hand_lm = result.hand_landmarks[0]
-                handedness = result.handedness[0][0].category_name
-                lm = _lm_arr(hand_lm)
-                lm_px = [(int(p.x * w_f), int(p.y * h_f)) for p in hand_lm]
-                last_lm = lm
-
-                raw_gesture, is_custom, _dist = classify_with_trainer(lm, handedness)
-                stable = stab.update(raw_gesture)
-
-                if stable == pending:
-                    hold_count += 1
-                else:
-                    pending = stable
-                    hold_count = 1
-
-                state.set_gesture(
-                    stable or "NO HAND", confidence=0.0, hold_frames=hold_count, hands=1
-                )
-
-                # ── Signal execution ──────────────────────────────────────────
-                min_hold = CFG.gesture_hold_frames
-                if (
-                    hold_count >= min_hold
-                    and stable is not None
-                    and stable != prev_stable
-                ):
-                    cmd = (
-                        TRAINER.command_for(stable)
-                        if is_custom
-                        else CFG.gesture_map.get(stable, "none")
-                    )
-
-                    if cmd and cmd != "none":
-                        state.dispatch_command(cmd, logger)
-                        src = "custom" if is_custom else "builtin"
-                        logger.ok(
-                            f"gesture [{src}] {stable} -> {cmd}  (hold={hold_count})"
-                        )
-                    else:
-                        logger.info(f"gesture {stable} mapped to 'none' — skipped")
-
-                    prev_stable = stable
-                    hold_count = 0
-
-                elif stable and stable != prev_stable:
-                    logger.info(f"gesture: {stable}  hold={hold_count}/{min_hold}")
-
-                hand_color = (
-                    CUSTOM_COLOR
-                    if is_custom
-                    else BUILTIN_COLORS.get(stable, NONE_COLOR)
-                )
-                _draw_hand(frame, lm_px, hand_color)
-
-                wx, wy = lm_px[WRIST]
-                label = stable or "..."
-                lbl_col = (
-                    CUSTOM_COLOR
-                    if is_custom
-                    else BUILTIN_COLORS.get(stable, (200, 200, 200))
-                )
-                tw = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.7, 2)[0][0]
-                _draw_rect_alpha(
-                    frame,
-                    wx - tw // 2 - 12,
-                    max(wy - 55, 5),
-                    wx + tw // 2 + 12,
-                    max(wy - 10, 50),
-                    lbl_col,
-                    0.45,
-                )
-                _shadow_text(
-                    frame,
-                    label,
-                    (wx - tw // 2, max(wy - 15, 45)),
-                    cv2.FONT_HERSHEY_DUPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2,
-                )
-            else:
-                last_lm = None
-                if pending is not None:
-                    logger.info("gesture: no hand detected")
-                pending = None
-                hold_count = 0
-                state.set_gesture("NO HAND", confidence=0.0, hold_frames=0, hands=0)
-
-            _draw_hud(
-                frame,
-                raw_gesture,
-                is_custom,
-                fps,
-                state,
-                recording=TRAINER.is_clip_active(),  # only show banner while clip is live
-                sample_count=TRAINER.frame_count(),
-            )
-
+    while state.alive():
+        # Pull the latest inference result; skip this display tick if not ready
+        try:
+            frame, result = result_q.get(timeout=0.05)
+        except queue.Empty:
+            # Keep the window responsive even when no result is ready
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 logger.warn("vision: quit by user (Q)")
@@ -474,8 +509,127 @@ def gesture_vision_thread(cam_idx: int, state: PhantomState, logger: Logger):
             elif key == ord(" "):
                 new_state = state.toggle()
                 logger.info(f"space: {'PLAY' if new_state else 'PAUSE'}")
+            continue
+
+        h_f, w_f = frame.shape[:2]
+        now = time.time()
+        fps = 1.0 / max(now - prev_time, 1e-9)
+        prev_time = now
+
+        # ── Trainer capture latch ─────────────────────────────────────────────
+        if getattr(state, "clip_recording_active", False):
+            if last_lm is not None and TRAINER.is_recording():
+                # Pass a copy — _LM_BUF is overwritten next frame
+                TRAINER.capture_frame(last_lm.copy())
+
+        # ── Classification ────────────────────────────────────────────────────
+        raw_gesture = None
+        is_custom = False
+
+        if result.hand_landmarks:
+            hand_lm = result.hand_landmarks[0]
+            handedness = result.handedness[0][0].category_name
+
+            # Write into pre-allocated buffer (no heap alloc)
+            lm = _lm_arr(hand_lm)
+            lm_px = [(int(p.x * w_f), int(p.y * h_f)) for p in hand_lm]
+
+            # Keep a copy for the trainer latch (buffer is reused next frame)
+            last_lm = lm.copy()
+
+            raw_gesture, is_custom, _dist = classify_with_trainer(lm, handedness)
+            stable = stab.update(raw_gesture)
+
+            if stable == pending:
+                hold_count += 1
+            else:
+                pending = stable
+                hold_count = 1
+
+            state.set_gesture(
+                stable or "NO HAND", confidence=0.0, hold_frames=hold_count, hands=1
+            )
+
+            # ── Signal execution ──────────────────────────────────────────────
+            min_hold = CFG.gesture_hold_frames
+            if hold_count >= min_hold and stable is not None and stable != prev_stable:
+                cmd = (
+                    TRAINER.command_for(stable)
+                    if is_custom
+                    else CFG.gesture_map.get(stable, "none")
+                )
+                if cmd and cmd != "none":
+                    state.dispatch_command(cmd, logger)
+                    src = "custom" if is_custom else "builtin"
+                    logger.ok(f"gesture [{src}] {stable} -> {cmd}  (hold={hold_count})")
+                else:
+                    logger.info(f"gesture {stable} mapped to 'none' — skipped")
+
+                prev_stable = stable
+                hold_count = 0
+            elif stable and stable != prev_stable:
+                logger.info(f"gesture: {stable}  hold={hold_count}/{min_hold}")
+
+            hand_color = (
+                CUSTOM_COLOR if is_custom else BUILTIN_COLORS.get(stable, NONE_COLOR)
+            )
+            _draw_hand(frame, lm_px, hand_color)
+
+            wx, wy = lm_px[WRIST]
+            label = stable or "..."
+            lbl_col = (
+                CUSTOM_COLOR
+                if is_custom
+                else BUILTIN_COLORS.get(stable, (200, 200, 200))
+            )
+            tw = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.7, 2)[0][0]
+            _draw_rect_alpha(
+                frame,
+                wx - tw // 2 - 12,
+                max(wy - 55, 5),
+                wx + tw // 2 + 12,
+                max(wy - 10, 50),
+                lbl_col,
+                0.45,
+            )
+            _shadow_text(
+                frame,
+                label,
+                (wx - tw // 2, max(wy - 15, 45)),
+                cv2.FONT_HERSHEY_DUPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
+        else:
+            last_lm = None
+            if pending is not None:
+                logger.info("gesture: no hand detected")
+            pending = None
+            hold_count = 0
+            state.set_gesture("NO HAND", confidence=0.0, hold_frames=0, hands=0)
+
+        # _draw_hud(
+        #     frame,
+        #     raw_gesture,
+        #     is_custom,
+        #     fps,
+        #     state,
+        #     recording=TRAINER.is_clip_active(),
+        #     sample_count=TRAINER.frame_count(),
+        # )
+
+        # cv2.imshow("Phantom Conductor", frame)
+        # key = cv2.waitKey(1) & 0xFF
+        # if key == ord("q"):
+        #     logger.warn("vision: quit by user (Q)")
+        #     state.stop()
+        #     break
+        # elif key == ord(" "):
+        #     new_state = state.toggle()
+        #     logger.info(f"space: {'PLAY' if new_state else 'PAUSE'}")
 
     cap.release()
-    cv2.destroyAllWindows()
+    # cv2.destroyAllWindows()
     logger.warn("gesture_vision_thread exited")
     state.stop()

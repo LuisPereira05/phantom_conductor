@@ -136,7 +136,7 @@ def estimate_bpm(
 
     bpm_raw = 60.0 * sr / (HOP_LENGTH * lag)
     bpm_corr = float(np.clip(_octave_correct(bpm_raw, bpm_prev), min_bpm, max_bpm))
-
+    # bpm_corr = float(np.clip(bpm_raw, min_bpm, max_bpm))
     if bpm_prev is None or not np.isfinite(bpm_prev):
         bpm_s = bpm_corr
     elif abs(bpm_corr - bpm_prev) < 5.0:
