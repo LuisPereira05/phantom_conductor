@@ -35,6 +35,7 @@ Changes from v0.5.3 (tempo tapper gating fix)
   only thing keeping the two sources from fighting.
 """
 
+import collections
 import threading
 import time
 
@@ -63,6 +64,7 @@ class PhantomState:
         self.last_bpm_analysis_dbg: dict = {}  # always fresh, even when
         # tapper mode gates the write
         self._tap_override_until: float = 0.0
+        self.recent_beat_times: collections.deque[float] = collections.deque(maxlen=4)
 
         # Playback
         self.is_playing: bool = False
@@ -375,4 +377,5 @@ class PhantomState:
             d = self.__dict__.copy()
             d.pop("_lock", None)
             d.pop("queue", None)
+            d["recent_beat_times"] = list(self.recent_beat_times)  # deque → list
             return d

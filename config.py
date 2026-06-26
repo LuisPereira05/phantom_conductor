@@ -42,7 +42,10 @@ _DEFAULTS: dict = {
     "smooth_alpha": 0.3,
     "min_bpm": 60,
     "max_bpm": 200,
-    "analyze_every": 0.25,  # seconds between analysis passes
+    "analyze_every": 0.25,
+    # seconds between analysis passes
+    "bpm_median_window": 8,  # increase for stability, decrease for faster response
+    "rms_threshold": 0.01,  # raise if detecting in silence, lower if missing quiet playing
 }
 
 

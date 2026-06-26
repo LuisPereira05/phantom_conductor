@@ -194,11 +194,29 @@ def backing_track_thread(state: PhantomState, logger: Logger):
     state.dispatch_command("next"/"prev") — e.g. from a trained gesture
     or the UI's Prev/Next buttons.  Checked every iteration, even while
     paused or idle, so a skip request is never silently dropped.
+
+    Phase-lock loop (PLL)
+    ---------------------
+    Each beat, any new timestamps from state.recent_beat_times are fed into
+    a PhaseLock instance.  It compares each detected beat against the
+    extrapolated grid, gates outliers beyond ±half-beat, averages the last
+    few accepted deltas, and returns a small rate multiplier that nudges
+    playback toward phase-lock over ~10 beats.  The final stretch rate is:
+
+        rate = (bpm_live / bpm_orig) * pll.rate_correction
+
+    The PLL resets whenever a new track loads so stale phase error from the
+    previous track doesn't bleed into the next one.
     """
+    from phase_lock import PhaseLock
+
     y_full = None
     bpm_orig = 120.0
     pos = 0
     t_next = time.time()
+
+    pll = PhaseLock(logger=logger)
+    last_seen_beat: float | None = None  # newest beat timestamp already fed to PLL
 
     while state.alive():
         # ── Check for a manual skip request (gesture / tapper / UI) ───────────
@@ -213,8 +231,6 @@ def backing_track_thread(state: PhantomState, logger: Logger):
                 logger.info(f"skip: {skip} → {next_t['name']}")
             else:
                 logger.info(f"skip: {skip} requested but queue has no track")
-            # Fall through — the load_new_track check below will pick
-            # this up on the same iteration.
 
         # ── Check for a new track to load ─────────────────────────────────────
         with state._lock:
@@ -247,6 +263,11 @@ def backing_track_thread(state: PhantomState, logger: Logger):
                 state.play()
                 logger.ok(f"playing: {new_track['name']}  BPM={bpm_orig:.1f}")
 
+                # Reset PLL — stale phase error from the previous track is
+                # meaningless for the new one.
+                pll.reset()
+                last_seen_beat = None
+
             except Exception as e:
                 logger.err(f"failed to load track: {e}")
                 y_full = None
@@ -271,6 +292,8 @@ def backing_track_thread(state: PhantomState, logger: Logger):
             if looping:
                 pos = 0
                 t_next = time.time()
+                pll.reset()
+                last_seen_beat = None
                 logger.info("loop: restarting")
             else:
                 next_t = state.queue.next_track()
@@ -297,7 +320,20 @@ def backing_track_thread(state: PhantomState, logger: Logger):
 
         block = y_full[pos:end] * gain
         bpm_live = state.get_bpm() or safe_orig
-        rate = bpm_live / safe_orig
+
+        # ── Feed new detected beats into the PLL ──────────────────────────────
+        # recent_beat_times is a deque(maxlen=4) written by the audio-analysis
+        # thread.  We snapshot it, then feed only timestamps we haven't seen yet
+        # (newer than last_seen_beat) so each real beat is counted exactly once.
+        for bt in list(state.recent_beat_times):
+            if last_seen_beat is None or bt > last_seen_beat:
+                pll.update(beat_time=bt, bpm=bpm_live)
+                last_seen_beat = bt
+
+        # ── Compute stretch rate with phase correction ─────────────────────────
+        # pll.rate_correction is 1.0 until the PLL has seen enough beats to form
+        # a phase estimate, so there is no effect during the first few seconds.
+        rate = (bpm_live / safe_orig) * pll.rate_correction
 
         # Time-stretch
         if HAS_PYRB and len(block) > 512 and abs(rate - 1.0) > 0.005:

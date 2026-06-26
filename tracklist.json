@@ -1,8 +1,14 @@
 [
   {
     "name": "Owner of a Lonely Heart (2008 Remaster) [TubeRipper.cc].wav",
-    "path": "audio\\Owner of a Lonely Heart (2008 Remaster) [TubeRipper.cc].wav",
-    "bpm": 125.0,
+    "path": "audio/Owner of a Lonely Heart (2008 Remaster) [TubeRipper.cc].wav",
+    "bpm": 126.04801829268293,
     "duration": 0.0
+  },
+  {
+    "name": "Guns N' Roses - Knockin' On Heaven's Door (Visualizer).mp3",
+    "path": "audio/Guns N' Roses - Knockin' On Heaven's Door (Visualizer).mp3",
+    "bpm": 132.51201923076923,
+    "duration": 335.3861224489796
   }
 ]

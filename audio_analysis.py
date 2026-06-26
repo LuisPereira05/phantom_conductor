@@ -7,35 +7,41 @@ a smoothed, octave-corrected BPM estimate back to PhantomState.
 DSP chain
 ---------
   raw samples
-    → bandpass filter (40–3000 Hz)
+    → RMS gate  (skip if below CFG.rms_threshold, default 0.01)
+    → bandpass filter (40–8000 Hz)
     → HPSS (percussive component)
     → onset strength (median aggregate)
-    → full autocorrelation
+    → full autocorrelation  (sliced from centre: ac_full[ac_full.size // 2:])
     → parabolic peak interpolation
-    → octave correction  (½× / 1× / 2× closest to previous)
-    → exponential smoothing (α = CFG.smooth_alpha)
+    → octave correction  (½× / 1× / 2× closest to bpm_original)
+    → median filter over rolling window of raw estimates (spike rejection)
     → STATE.apply_audio_bpm()
 
-Changes from v0.5.0
---------------------
-* MIN_BPM, MAX_BPM, SMOOTH_ALPHA, ANALYZE_EVERY now read from CFG so
-  that the Settings panel can override them at runtime.
+Smoothing strategy
+------------------
+The old exponential smoother blended every new estimate into the previous
+value, so a single bad estimate (octave error, autocorrelation mis-peak)
+would drag the output for several seconds.  The median filter keeps a
+rolling window of the last N raw estimates and outputs their median.  One
+bad estimate out of eight is simply outvoted and has zero effect on output.
+Window size is CFG.bpm_median_window (default 8).  Larger = more stable
+but slower to respond to genuine tempo changes.
 
-Changes from v0.5.2 (tempo tapper)
------------------------------------
-* bpm_analysis_thread now checks CFG.use_tempo_tapper on every pass
-  (not just at startup) and skips writing audio-derived BPM entirely
-  while tapper mode is enabled. Previously the only thing preventing
-  audio from overwriting a tap was the 4s override window in
-  state.apply_audio_bpm(), so the mic would silently take back over
-  a few seconds after every tap. Checking the live config flag here
-  means flipping the Settings checkbox takes effect immediately,
-  in both directions, with no thread restart needed.
-* Still calls estimate_bpm() even while gated off, so bpm_analysis_dbg
-  stays fresh for diagnostics — it just doesn't push the result into
-  state when tapper mode owns the BPM.
+Changes from v0.5.x
+--------------------
+* Bandpass widened 3 kHz → 8 kHz: preserves pick-attack transients
+  (3–5 kHz) which carry the clearest rhythmic signal for rhythm guitar.
+* Autocorrelation slice uses ac_full[ac_full.size // 2:] — correct for
+  even-length onset arrays; the previous [len(onset)-1:] was off-by-one.
+* _octave_correct anchors to bpm_original (stable ground truth) instead
+  of the previous smoothed estimate (could drift and self-reinforce).
+* Exponential smoother replaced by rolling median filter (see above).
+* RMS gate: skip analysis entirely when signal is below threshold.
+* PLL / beat timestamp machinery removed — tempo-only tracking.
+* CFG.use_tempo_tapper gating retained unchanged.
 """
 
+import collections
 import time
 
 import librosa
@@ -49,7 +55,7 @@ from state import PhantomState
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 HOP_LENGTH = 256
-BANDPASS = (40, 3000)
+BANDPASS = (40, 8000)  # widened from 3000 — preserves pick-attack transients
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -82,10 +88,17 @@ def _pick_peak(ac: np.ndarray, lag_min: int, lag_max: int) -> float | None:
     return float(i)
 
 
-def _octave_correct(bpm: float, prev: float | None) -> float:
-    if prev is None or not np.isfinite(prev):
+def _octave_correct(bpm: float, bpm_original: float | None) -> float:
+    """
+    Pick the octave of bpm (½×, 1×, 2×) closest to bpm_original.
+    bpm_original is the known tempo of the backing track — a stable ground
+    truth that never drifts, unlike a previous smoothed estimate would.
+    Falls back to returning bpm unchanged if bpm_original is unavailable.
+    """
+    if bpm_original is None or not np.isfinite(bpm_original) or bpm_original <= 0:
         return bpm
-    return min([bpm / 2, bpm, bpm * 2], key=lambda x: abs(x - prev))
+    candidates = [bpm / 2, bpm, bpm * 2]
+    return min(candidates, key=lambda x: abs(x - bpm_original))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -94,19 +107,25 @@ def _octave_correct(bpm: float, prev: float | None) -> float:
 
 
 def estimate_bpm(
-    y: np.ndarray, sr: int = SR, bpm_prev: float | None = None
+    y: np.ndarray,
+    sr: int = SR,
+    bpm_original: float | None = None,
+    logger: Logger | None = None,
 ) -> tuple[float | None, dict]:
     """
     Estimate BPM from a buffer of audio samples.
 
     Returns
     -------
-    (bpm_smoothed, debug_dict)
-    bpm_smoothed is None when the buffer is too short or too quiet.
+    (bpm_corr, debug_dict)
+    bpm_corr is the single-window octave-corrected estimate before median
+    filtering.  Returns None when the buffer is too short, too quiet, or
+    the autocorrelation produces an invalid peak.
+    Smoothing (median filter) is handled in bpm_analysis_thread so the
+    rolling window persists across calls.
     """
     min_bpm = CFG.min_bpm
     max_bpm = CFG.max_bpm
-    smooth_alpha = CFG.smooth_alpha
 
     if len(y) < sr * 2:
         return None, {"msg": "buffer too short"}
@@ -123,9 +142,12 @@ def estimate_bpm(
     if onset.size < 8 or np.max(onset) < 1e-3:
         return None, {"msg": "weak onset"}
 
-    ac = np.correlate(onset, onset, mode="full")[len(onset) - 1 :]
-    lag_min = max(2, int(np.floor(60 * sr / (max_bpm * HOP_LENGTH))))
-    lag_max = min(int(np.ceil(60 * sr / (min_bpm * HOP_LENGTH))), len(ac) - 1)
+    # Slice from centre of full correlogram — correct for even-length arrays.
+    ac_full = np.correlate(onset, onset, mode="full")
+    ac = ac_full[ac_full.size // 2 :]
+
+    lag_min = max(2, int(np.floor(60.0 * sr / (max_bpm * HOP_LENGTH))))
+    lag_max = min(int(np.ceil(60.0 * sr / (min_bpm * HOP_LENGTH))), len(ac) - 1)
 
     if lag_min >= lag_max:
         return None, {"msg": "invalid range"}
@@ -135,16 +157,15 @@ def estimate_bpm(
         return None, {"msg": "invalid lag"}
 
     bpm_raw = 60.0 * sr / (HOP_LENGTH * lag)
-    bpm_corr = float(np.clip(_octave_correct(bpm_raw, bpm_prev), min_bpm, max_bpm))
-    # bpm_corr = float(np.clip(bpm_raw, min_bpm, max_bpm))
-    if bpm_prev is None or not np.isfinite(bpm_prev):
-        bpm_s = bpm_corr
-    elif abs(bpm_corr - bpm_prev) < 5.0:
-        bpm_s = smooth_alpha * bpm_corr + (1 - smooth_alpha) * bpm_prev
-    else:
-        bpm_s = bpm_corr
+    bpm_corr = float(np.clip(_octave_correct(bpm_raw, bpm_original), min_bpm, max_bpm))
 
-    return bpm_s, {
+    if logger is not None:
+        logger.debug(
+            f"bpm_raw={bpm_raw:.1f}  bpm_corr={bpm_corr:.1f}  "
+            f"onset_max={float(np.max(onset)):.3f}"
+        )
+
+    return bpm_corr, {
         "bpm_raw": float(bpm_raw),
         "bpm_corr": bpm_corr,
         "onset_max": float(np.max(onset)),
@@ -158,26 +179,58 @@ def estimate_bpm(
 
 def bpm_analysis_thread(state: PhantomState, logger: Logger):
     """
-    Runs in a daemon thread.  Every CFG.analyze_every seconds it copies the
-    current contents of audio_buffer and runs estimate_bpm().
+    Runs in a daemon thread.  Every CFG.analyze_every seconds it:
+      1. Gates on RMS — skips silences entirely.
+      2. Calls estimate_bpm() to get a single-window BPM estimate.
+      3. Pushes it into a rolling deque and outputs the median — this
+         rejects spikes without the lag that exponential smoothing causes.
+      4. Writes the result to state via apply_audio_bpm(), unless
+         CFG.use_tempo_tapper is True (tap input owns BPM in that mode).
 
-    While CFG.use_tempo_tapper is True, the result is computed (so debug
-    info stays live for the HUD) but NOT written to state — tap input
-    owns state.bpm_live exclusively in that mode. This check happens on
-    every pass, so toggling the Settings checkbox takes effect on the
-    very next analysis cycle, not just at thread startup.
+    Median window
+    -------------
+    CFG.bpm_median_window (default 8) controls the trade-off:
+      • Larger → more spike rejection, slower response to real tempo changes.
+      • Smaller → faster response, more susceptible to single bad estimates.
+    At CFG.analyze_every=0.25s, a window of 8 covers the last 2 seconds.
     """
     last = 0.0
     tapper_was_active = False
+
+    # Rolling window of octave-corrected single-window estimates.
+    # Median of this window is what gets written to state.
+    bpm_window: collections.deque[float] = collections.deque(
+        maxlen=CFG.get("bpm_median_window", 8)
+    )
 
     while state.alive():
         analyze_every = CFG.analyze_every
         now = time.time()
 
+        # Keep window size in sync with live config without recreating deque.
+        new_window_size = CFG.get("bpm_median_window", 8)
+        if new_window_size != bpm_window.maxlen:
+            bpm_window = collections.deque(bpm_window, maxlen=new_window_size)
+
         if now - last >= analyze_every and len(audio_buffer) >= SR * 2:
             last = now
             y = np.array(audio_buffer, dtype=np.float32)
-            bpm_new, dbg = estimate_bpm(y, bpm_prev=state.get_bpm())
+
+            # ── RMS gate — skip analysis in silence ───────────────────────────
+            rms = float(np.sqrt(np.mean(y**2)))
+            rms_threshold = CFG.get("rms_threshold", 0.01)
+            if rms < rms_threshold:
+                logger.debug(f"bpm-analysis: silent (rms={rms:.4f} < {rms_threshold})")
+                with state._lock:
+                    state.buffer_fill = min(1.0, len(audio_buffer) / (SR * 10))
+                continue
+
+            # ── Estimate ──────────────────────────────────────────────────────
+            bpm_new, dbg = estimate_bpm(
+                y,
+                bpm_original=state.bpm_original,
+                logger=logger,
+            )
 
             tapper_active = CFG.get("use_tempo_tapper", False)
 
@@ -191,11 +244,17 @@ def bpm_analysis_thread(state: PhantomState, logger: Logger):
                 )
             tapper_was_active = tapper_active
 
-            if bpm_new and np.isfinite(bpm_new):
-                state.last_bpm_analysis_dbg = dbg  # always kept fresh for HUD/debug
+            if bpm_new is not None and np.isfinite(bpm_new):
+                state.last_bpm_analysis_dbg = dbg
+
+                # ── Median filter — spike-resistant smoothing ──────────────────
+                # One outlier in a window of 8 is outvoted and has zero effect.
+                bpm_window.append(bpm_new)
+                bpm_smooth = float(np.median(bpm_window))
+
                 if not tapper_active:
                     wrote = state.apply_audio_bpm(
-                        bpm_new,
+                        bpm_smooth,
                         raw=dbg.get("bpm_raw"),
                         corrected=dbg.get("bpm_corr"),
                         onset_max=dbg.get("onset_max", 0.0),
@@ -204,8 +263,6 @@ def bpm_analysis_thread(state: PhantomState, logger: Logger):
                         state.last_bpm_dbg = dbg
 
             with state._lock:
-                state.buffer_fill = min(
-                    1.0, len(audio_buffer) / (SR * 10)
-                )  # 10 s == full
+                state.buffer_fill = min(1.0, len(audio_buffer) / (SR * 10))
 
         time.sleep(analyze_every / 4)
