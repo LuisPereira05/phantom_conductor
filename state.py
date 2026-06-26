@@ -39,6 +39,8 @@ import collections
 import threading
 import time
 
+import numpy as np
+
 from config import CFG
 from tracklist import PersistentQueue
 
@@ -115,8 +117,42 @@ class PhantomState:
         self.running: bool = True
         self.start_time: float = time.time()
 
+        # Reference track data
+        self.reference_features: np.ndarray | None = None  # (n_beats, 31)
+        self.reference_beat_times: np.ndarray | None = None  # (n_beats,)
+        self.current_song_id = None
+
+        # Timing alignment outputs (replacing bpm_live for playback)
+        self.playback_speed: float = 1.0  # 1.0 = normal, 1.05 = 5% faster
+        self.current_delta_t: float = 0.0  # Latest Δt in seconds
+        self.timing_mode: str = "bpm"  # "bpm" | "neural" | "tap"
+
         # Persistent track queue
         self.queue: PersistentQueue = PersistentQueue()
+
+    def load_song_reference(self, song_id: str, cache_dir: str = "./reference_cache"):
+        """Call when track changes. Loads pre-computed reference features."""
+        from analysis.reference_cache import load_reference_features
+
+        cache = load_reference_features(song_id, cache_dir)
+
+        with self._lock:
+            self.reference_features = cache["features"]  # numpy (n_beats, 31)
+            self.reference_beat_times = cache["beat_times"]  # numpy (n_beats,)
+            self.reference_tempo = cache["tempo"]
+            self.current_song_id = song_id
+            self.playback_speed = 1.0
+            self.current_delta_t = 0.0
+
+    def apply_playback_speed(self, speed: float, delta_t: float | None = None):
+        """Called by timing_analysis_thread. Smoothed speed update."""
+        with self._lock:
+            # Exponential smoothing to prevent jumps
+            alpha = CFG.get("speed_smoothing_alpha", 0.15)
+            smoothed = alpha * speed + (1 - alpha) * self.playback_speed
+            self.playback_speed = float(np.clip(smoothed, 0.85, 1.15))
+            if delta_t is not None:
+                self.current_delta_t = delta_t
 
     # ── Playback ──────────────────────────────────────────────────────────────
     def play(self):
@@ -163,7 +199,13 @@ class PhantomState:
             self.bpm_live = bpm
             self.bpm_raw = raw if raw is not None else bpm
             self.bpm_corrected = corrected if corrected is not None else bpm
-            self.stretch_ratio = bpm / self.bpm_original if self.bpm_original else 1.0
+            if self.timing_mode == "neural":
+                # Neural timing: use playback_speed directly
+                # speed > 1.0 means play faster to catch up (musician is behind)
+                self.stretch_ratio = self.playback_speed
+            else:
+                # Legacy BPM mode
+                self.stretch_ratio = self.bpm_live / self.bpm_original
             self.onset_max = onset_max
 
     def apply_tap_bpm(self, bpm: float):

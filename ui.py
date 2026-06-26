@@ -560,6 +560,45 @@ class PhantomUI(GestureTrainUI):
             dpg.add_separator()
             dpg.add_spacer(height=4)
 
+            # ── Row 0: Neural Timing Alignment (NEW) ───────────────────────────
+            with dpg.group(horizontal=True):
+                dpg.add_text("TIMING", color=C["amber"])
+                dpg.add_spacer(width=8)
+
+                with dpg.group(width=200):
+                    dpg.add_text("Mode", color=C["text_dim"])
+                    dpg.add_combo(
+                        items=["BPM Detection", "Neural Timing"],
+                        tag="timing_mode_combo",
+                        default_value="BPM Detection"
+                        if not CFG.get("use_neural_timing", False)
+                        else "Neural Timing",
+                        width=190,
+                        callback=self._cb_timing_mode,
+                    )
+
+                dpg.add_spacer(width=6)
+
+                with dpg.group(width=200):
+                    dpg.add_text("Δt (ms)", color=C["text_dim"])
+                    dpg.add_text(
+                        "—",
+                        tag="timing_delta_t",
+                        color=C["text_dim"],
+                    )
+
+                dpg.add_spacer(width=6)
+
+                with dpg.group(width=200):
+                    dpg.add_text("Speed", color=C["text_dim"])
+                    dpg.add_text(
+                        "—",
+                        tag="timing_speed",
+                        color=C["text_dim"],
+                    )
+
+            dpg.add_spacer(height=4)
+
             # ── Row 1: Audio I/O devices ──────────────────────────────────────
             with dpg.group(horizontal=True):
                 dpg.add_text("AUDIO", color=C["amber"])
@@ -926,6 +965,68 @@ class PhantomUI(GestureTrainUI):
                 horizontal_scrollbar=False,
             ):
                 dpg.add_text("— empty —", tag="queue_empty_label", color=C["text_dim"])
+
+    def _build_training_section(self):
+        with dpg.collapsing_header(label="MODEL TRAINING", default_open=False):
+            dpg.add_text("Train timing model on backing tracks", color=C["text_dim"])
+            dpg.add_spacer(height=4)
+
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label=" CACHE REFERENCES ",
+                    callback=self._cb_cache_references,
+                    width=140,
+                )
+                dpg.add_spacer(width=8)
+                dpg.add_button(
+                    label=" TRAIN MODEL ",
+                    callback=self._cb_train_model,
+                    width=140,
+                )
+                dpg.bind_item_theme("train_model_btn", self._th_grn)
+
+            dpg.add_spacer(height=4)
+            dpg.add_text("Status:", color=C["text_dim"])
+            dpg.add_text("Idle", tag="train_status", color=C["text_dim"])
+
+    def _cb_cache_references(self, sender, app_data):
+        """Pre-compute reference features for all tracks in queue."""
+        from analysis.reference_cache import cache_reference_features
+
+        dpg.set_value("train_status", "Caching...")
+
+        tracks = STATE.queue.snapshot()[0]  # list of track dicts
+        for track in tracks:
+            try:
+                cache_reference_features(track["path"], output_dir="./reference_cache")
+            except Exception as e:
+                Logger.warning(f"[train] Failed to cache {track['name']}: {e}")
+
+        dpg.set_value("train_status", f"Cached {len(tracks)} tracks")
+        Logger.info("[train] Reference caching complete")
+
+    def _cb_train_model(self, sender, app_data):
+        """Launch training in background thread."""
+        import threading
+
+        def train_thread():
+            dpg.set_value("train_status", "Training...")
+            try:
+                from training.train import train
+
+                train(
+                    audio_dir="./audio",
+                    output_path=CFG.timing_model_path,
+                    epochs=CFG.get("training_epochs", 100),
+                    batch_size=CFG.get("training_batch_size", 32),
+                    use_lightweight=(torch.device("cpu").type == "cpu"),
+                )
+                dpg.set_value("train_status", "Training complete!")
+            except Exception as e:
+                dpg.set_value("train_status", f"Error: {str(e)[:40]}")
+                Logger.error(f"[train] {e}")
+
+        threading.Thread(target=train_thread, daemon=True).start()
 
     def _build_log_panel(self):
         with dpg.child_window(height=130, border=True, tag="log_panel"):

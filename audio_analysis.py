@@ -43,6 +43,7 @@ Changes from v0.5.x
 
 import collections
 import time
+import torch
 
 import librosa
 import numpy as np

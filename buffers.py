@@ -13,7 +13,7 @@ from collections import deque
 from queue import Queue
 
 # Sample rate assumed everywhere
-SR         = 44100
+SR = 48000
 BUFFER_SEC = 10
 
 # Raw microphone samples (float32 mono).

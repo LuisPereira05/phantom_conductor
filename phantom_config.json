@@ -20,5 +20,7 @@
   "smooth_alpha": 0.3,
   "min_bpm": 60,
   "max_bpm": 200,
-  "analyze_every": 0.25
+  "analyze_every": 0.25,
+  "bpm_median_window": 4,
+  "rms_threshold": 0.03
 }

@@ -44,8 +44,19 @@ _DEFAULTS: dict = {
     "max_bpm": 200,
     "analyze_every": 0.25,
     # seconds between analysis passes
-    "bpm_median_window": 8,  # increase for stability, decrease for faster response
-    "rms_threshold": 0.01,  # raise if detecting in silence, lower if missing quiet playing
+    "bpm_median_window": 6,  # increase for stability, decrease for faster response
+    "rms_threshold": 0.025,  # raise if detecting in silence, lower if missing quiet playing
+    "timing_model_path": "./models/timing_aligner_v1.pt",
+    "timing_seq_len": 32,
+    # Speed controller
+    "speed_k_p": 2.0,
+    "speed_k_i": 0.1,
+    "speed_k_d": 0.5,
+    "max_playback_speed": 1.15,
+    "min_playback_speed": 0.85,
+    "speed_smoothing_alpha": 0.15,
+    "delta_median_window": 8,
+    "use_neural_timing": False,  # Toggle between BPM and neural timing
 }
 
 
@@ -67,16 +78,16 @@ class Config:
 
     # ── Persistence ───────────────────────────────────────────────────────────
     def load(self):
-        """Load from JSON, filling missing keys from _DEFAULTS."""
         if not os.path.exists(CONFIG_PATH):
             return
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             with self._lock:
-                for k, v in saved.items():
-                    if k in self._data:
-                        self._data[k] = v
+                # Merge: saved values win, but new defaults are preserved
+                merged = dict(_DEFAULTS)
+                merged.update(saved)
+                self._data = merged
         except Exception as e:
             print(f"[config] load failed: {e}")
 

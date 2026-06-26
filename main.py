@@ -73,12 +73,36 @@ def main():
     logger = Logger()
 
     # ── Worker threads ─────────────────────────────────────────────────────────
-    threading.Thread(
-        target=bpm_analysis_thread,
-        args=(state, logger),
-        daemon=True,
-        name="bpm-analysis",
-    ).start()
+    if CFG.use_neural_timing:
+        # NEW: Neural timing alignment
+        from analysis.timing_analysis import timing_analysis_thread
+
+        threading.Thread(
+            target=timing_analysis_thread,
+            args=(state, logger),
+            daemon=True,
+            name="timing-analysis",
+        ).start()
+    else:
+        # LEGACY: BPM detection (your existing code)
+        from audio_analysis import bpm_analysis_thread
+
+        threading.Thread(
+            target=bpm_analysis_thread,
+            args=(state, logger),
+            daemon=True,
+            name="bpm-analysis",
+        ).start()
+
+        # Tempo tapper (always starts, checks CFG.use_tempo_tapper internally)
+        from tempo_tapper import tempo_tapper_thread
+
+        threading.Thread(
+            target=tempo_tapper_thread,
+            args=(state, logger),
+            daemon=True,
+            name="tempo-tapper",
+        ).start()
 
     threading.Thread(
         target=backing_track_thread,
@@ -99,13 +123,6 @@ def main():
         args=(cam_idx, state, logger),
         daemon=True,
         name="gesture-vision",
-    ).start()
-
-    threading.Thread(
-        target=tempo_tapper_thread,
-        args=(state, logger),
-        daemon=True,
-        name="tempo-tapper",
     ).start()
 
     # ── UI — must run on the main thread ───────────────────────────────────────
