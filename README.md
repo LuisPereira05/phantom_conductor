@@ -30,6 +30,13 @@ phantom_conductor/
 ├─ audio_processing.py      — track loading + beat-synced playback
 ├─ tempo_tapper.py          — Arduino foot-tapper serial bridge
 │
+├─ training/                — model training pipeline (not yet wired into
+│  ├─ record_onset_data.py     the live thread map — see "Learned onset
+│  ├─ plot_onsets.py            detection" below)
+│  ├─ onset_dataset.py
+│  ├─ onset_network.py
+│  └─ train_onset.py
+│
 ├─ video_input.py           — OpenCV camera + MediaPipe HandLandmarker
 ├─ gesture_recognition.py   — gesture classification + HUD overlay
 ├─ gesture_trainer.py       — custom gesture feature extraction/matching
@@ -93,6 +100,9 @@ warning and is otherwise harmless to leave running.
 | `audio_analysis.py` | BPM detection DSP chain from raw mic samples. |
 | `audio_processing.py` | Track loading and beat-synchronous backing-track playback with live time-stretching. |
 | `tempo_tapper.py` | Serial bridge to the Arduino foot-tapper. |
+| `training/record_onset_data.py` | Records guitar audio + tap-onset timestamps for onset-detector training data. |
+| `training/plot_onsets.py` | Sanity-check plot — overlays tap timestamps on the recorded waveform. |
+| `training/onset_dataset.py` / `onset_network.py` / `train_onset.py` | Trains a learned onset detector (see below). |
 | `gesture_recognition.py` | Hand-gesture classification (custom + built-in) and HUD overlay. |
 | `gesture_trainer.py` | Rotation-invariant feature extraction and custom gesture storage/matching. |
 | `gesture_train_ui.py` | Dear PyGui mixin for the gesture training workflow. |
@@ -246,6 +256,66 @@ just at thread startup; (2) avoids a race in the brief moment around the
 toggle. This module never decides PLAY/PAUSE — it only ever writes BPM. A
 second piezo/button for transport should route through
 `state.dispatch_command()`, the same way `gesture_recognition` does.
+
+## Learned onset detection — `training/` (in progress, not yet live-wired)
+
+**Why this exists:** `phase_lock.py`'s PLL is sound — given accurate beat
+timestamps, it correctly nudges playback rate toward phase-lock over
+~`pll_nudge_steps` beats. The problem in practice was upstream: guitar
+audio (sustained notes, soft attacks, vibrato) doesn't suit
+`librosa.onset.onset_strength`'s percussive-transient assumptions the way
+a drum or click track would, so the PLL was either never fed real beat
+events or fed unreliable ones. This is a guitar-specific onset-detection
+problem, not a PLL tuning problem.
+
+An earlier attempt at this used a `TimingAlignerNet` (reference-vs-live
+chroma/timbre comparison, intended to predict Δt directly) — abandoned
+because it solves a different problem (audio *alignment*, suited to a
+performer playing the *same musical content* as a reference) than what's
+actually needed here (live *tempo and phase tracking*, independent of
+musical content). It also required paired reference+performance training
+data with no real source, and its synthetic substitute (`reference
+features + Gaussian noise`) had no causal connection between its inputs
+and training labels. That branch's code is not part of the current design.
+
+**Current approach:** a small causal CNN (`OnsetNet`) over a log-mel
+spectrogram, predicting a per-frame onset probability from live guitar
+audio alone — no backing-track comparison involved. Peak-picking on that
+probability curve yields discrete onset timestamps, which is what
+`phase_lock.py.update(beat_time=...)` already expects.
+
+---
+
+### Data collection 
+```python training/record_onset_data.py --out training_data/take_001```
+
+Records mic audio and Arduino foot-tap timestamps simultaneously. Requires
+the **data-collection variant** of the tapper firmware (`tempo_tapper.ino`
+modified to emit `TAP:<millis>` immediately on every press, with the
+pairing/BPM logic removed — see `tempo_tapper.py`'s docstring for the
+live-tapper protocol this intentionally diverges from). Plays a distinct
+beep on every registered tap, audible while playing, as a live check that
+the serial line is being parsed correctly.
+
+Every take should be checked before use:
+
+```python -m training.train_onset --data-dir ./training_data --epochs 60```
+
+Builds `(log-mel spectrogram, soft Gaussian onset-probability curve)`
+training pairs from every `take_NNN.wav` / `take_NNN_onsets.json` pair
+found in `--data-dir`, trains `OnsetNet`, and saves the best checkpoint
+(by validation F1) to `./models/onset_net_v1.pt`.
+
+**Status:** training pipeline exists and runs; the resulting checkpoint
+is not yet loaded or consumed anywhere in the live thread map.
+Integration point, once a checkpoint is trained and validated: a new
+analysis thread (or an addition to `bpm_analysis_thread`) that runs
+`OnsetNet` on live mic audio, peak-picks the probability curve, and feeds
+the resulting timestamps into `state.recent_beat_times` — the same deque
+`backing_track_thread` already reads from to drive `pll.update()`. No
+changes to `phase_lock.py` itself should be needed; the gap was always the
+beat-detection signal feeding it, not the PLL logic.
+
 
 ---
 

@@ -297,7 +297,7 @@ def backing_track_thread(state: PhantomState, logger: Logger):
 
         block = y_full[pos:end] * gain
         bpm_live = state.get_bpm() or safe_orig
-        rate = bpm_live / safe_orig
+        rate = (state.bpm_live / state.bpm_original) * _pll.rate_correction
 
         # Time-stretch
         if HAS_PYRB and len(block) > 512 and abs(rate - 1.0) > 0.005:

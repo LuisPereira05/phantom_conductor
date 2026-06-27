@@ -43,6 +43,17 @@ _DEFAULTS: dict = {
     "min_bpm": 60,
     "max_bpm": 200,
     "analyze_every": 0.25,  # seconds between analysis passes
+    "bpm_smooth_window": 5,  # number of recent BPM estimates to median-filter
+    # ── OnsetNet (CNN beat detection) ─────────────────────────────────────────
+    # Toggle: True = OnsetNet CNN inference, False = classic DSP chain.
+    # Has no effect when models/onset_net_v1.pt is absent (DSP always used).
+    # Check state.onset_net_available before enabling in the UI.
+    "onset_silence_threshold": 0.01,  # RMS below this = silence, skip OnsetNet
+    "use_onset_net": False,
+    # Peak-picking parameters — tunable from the Settings panel at runtime.
+    "onset_threshold": 0.75,  # CNN probability threshold (0–1)
+    "onset_min_gap_sec": 0.25,  # minimum gap between accepted onsets (s)
+    # 0.10 s → max ~600 BPM, well above guitar range
 }
 
 

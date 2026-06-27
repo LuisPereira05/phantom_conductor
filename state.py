@@ -35,6 +35,7 @@ Changes from v0.5.3 (tempo tapper gating fix)
   only thing keeping the two sources from fighting.
 """
 
+import collections
 import threading
 import time
 
@@ -108,6 +109,10 @@ class PhantomState:
 
         # Tempo tapper (serial)
         self.tap_connected: bool = False
+
+        # Beat timestamps fed to the PLL by OnsetNet (or any other source)
+        self.recent_beat_times: collections.deque = collections.deque(maxlen=32)
+        self.onset_net_available: bool = False
 
         # System
         self.running: bool = True

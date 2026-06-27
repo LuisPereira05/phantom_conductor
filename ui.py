@@ -195,6 +195,7 @@ class PhantomUI(GestureTrainUI):
 
         # Last BPM source — only reconfigure pills when it actually changes
         self._last_bpm_source: str = ""
+        self._onset_flash_until: float = 0.0
 
     # ── theme helpers ─────────────────────────────────────────────────────────
     def _btn(self, fg, bg, bd):
@@ -436,8 +437,14 @@ class PhantomUI(GestureTrainUI):
                             color=C["amber"],
                             size=50,
                         )
-                dpg.add_spacer(width=16)
+                dpg.add_spacer(width=4)
                 with dpg.group():
+                    dpg.add_spacer(height=10)
+                    dpg.add_text(
+                        "●", tag="onset_dot", color=C["panel2"]
+                    )  # ← onset flash dot
+                    dpg.add_spacer(height=2)
+                    dpg.add_text("BEAT", color=C["text_dim"])
                     dpg.add_text("SOURCE:", color=C["text_dim"])
                     dpg.add_text("audio input", tag="bpm_source", color=C["text"])
                     dpg.add_spacer(height=4)
@@ -1282,6 +1289,18 @@ class PhantomUI(GestureTrainUI):
             )
         except Exception:
             pass
+        dbg = snap.get("last_bpm_analysis_dbg", {})
+        onsets_this_pass = dbg.get("onsets_this_pass", 0)
+
+        if onsets_this_pass > 0:
+            self._onset_flash_until = time.time() + 0.12  # flash for 120ms
+
+        dot_on = time.time() < self._onset_flash_until
+        dpg.configure_item(
+            "onset_dot",
+            color=C["green"] if dot_on else C["panel2"],
+        )
+        dpg.set_value("onset_val", f"{dbg.get('onset_prob_mean', 0.0):.3f}")
 
     def _update_waveform(self, snap):
         wave = snap["waveform"][-64:]

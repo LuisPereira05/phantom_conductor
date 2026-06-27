@@ -1,6 +1,6 @@
 {
-  "dev_in": 0,
-  "dev_out": 2,
+  "dev_in": 11,
+  "dev_out": 11,
   "input_gain": 0.9900000095367432,
   "output_gain": 0.8500000238418579,
   "cam_index": 0,
@@ -11,7 +11,7 @@
     "PEACE": "loop_toggle"
   },
   "gesture_hold_frames": 8,
-  "inference_skip_enabled": true,
+  "inference_skip_enabled": false,
   "inference_skip_frames": 2,
   "use_pedal": false,
   "pedal_key": "space",
@@ -20,5 +20,10 @@
   "smooth_alpha": 0.3,
   "min_bpm": 60,
   "max_bpm": 200,
-  "analyze_every": 0.25
+  "analyze_every": 0.75,
+  "bpm_smooth_window": 5,
+  "onset_silence_threshold": 0.01,
+  "use_onset_net": false,
+  "onset_threshold": 0.6,
+  "onset_min_gap_sec": 0.2
 }
