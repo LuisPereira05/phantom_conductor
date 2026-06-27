@@ -1,46 +1,3 @@
-"""
-Phantom Conductor — Audio Analysis (BPM Detection)
-===================================================
-Reads raw microphone samples from the shared ring buffer and writes
-a smoothed, octave-corrected BPM estimate back to PhantomState.
-
-DSP chain
----------
-  raw samples
-    → RMS gate  (skip if below CFG.rms_threshold, default 0.01)
-    → bandpass filter (40–8000 Hz)
-    → HPSS (percussive component)
-    → onset strength (median aggregate)
-    → full autocorrelation  (sliced from centre: ac_full[ac_full.size // 2:])
-    → parabolic peak interpolation
-    → octave correction  (½× / 1× / 2× closest to bpm_original)
-    → median filter over rolling window of raw estimates (spike rejection)
-    → STATE.apply_audio_bpm()
-
-Smoothing strategy
-------------------
-The old exponential smoother blended every new estimate into the previous
-value, so a single bad estimate (octave error, autocorrelation mis-peak)
-would drag the output for several seconds.  The median filter keeps a
-rolling window of the last N raw estimates and outputs their median.  One
-bad estimate out of eight is simply outvoted and has zero effect on output.
-Window size is CFG.bpm_median_window (default 8).  Larger = more stable
-but slower to respond to genuine tempo changes.
-
-Changes from v0.5.x
---------------------
-* Bandpass widened 3 kHz → 8 kHz: preserves pick-attack transients
-  (3–5 kHz) which carry the clearest rhythmic signal for rhythm guitar.
-* Autocorrelation slice uses ac_full[ac_full.size // 2:] — correct for
-  even-length onset arrays; the previous [len(onset)-1:] was off-by-one.
-* _octave_correct anchors to bpm_original (stable ground truth) instead
-  of the previous smoothed estimate (could drift and self-reinforce).
-* Exponential smoother replaced by rolling median filter (see above).
-* RMS gate: skip analysis entirely when signal is below threshold.
-* PLL / beat timestamp machinery removed — tempo-only tracking.
-* CFG.use_tempo_tapper gating retained unchanged.
-"""
-
 import collections
 import time
 
@@ -53,16 +10,12 @@ from config import CFG
 from logger import Logger
 from state import PhantomState
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Constants --------------------------------------------------------------
 HOP_LENGTH = 256
-BANDPASS = (40, 8000)  # widened from 3000 — preserves pick-attack transients
+BANDPASS = (40, 8000)  # Filtro "high-pass" para exponer transientes m
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  DSP HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 def _butter_bandpass(lo: float, hi: float, fs: int, order: int = 4):
     nyq = 0.5 * fs
     b, a = butter(order, [max(1e-3, lo / nyq), min(0.999, hi / nyq)], btype="band")
@@ -75,7 +28,7 @@ def _apply_bandpass(y: np.ndarray, fs: int, lo: float, hi: float) -> np.ndarray:
 
 
 def _pick_peak(ac: np.ndarray, lag_min: int, lag_max: int) -> float | None:
-    """Parabolic interpolation around the strongest autocorrelation peak."""
+    """Interpolación parabólica al rededor del pico más fuerte de autocorrelación."""
     seg = ac[lag_min : lag_max + 1]
     if not seg.size:
         return None
@@ -90,10 +43,9 @@ def _pick_peak(ac: np.ndarray, lag_min: int, lag_max: int) -> float | None:
 
 def _octave_correct(bpm: float, bpm_original: float | None) -> float:
     """
-    Pick the octave of bpm (½×, 1×, 2×) closest to bpm_original.
-    bpm_original is the known tempo of the backing track — a stable ground
-    truth that never drifts, unlike a previous smoothed estimate would.
-    Falls back to returning bpm unchanged if bpm_original is unavailable.
+    Elige la octava de BPM (1/2, normal, o x2) más cercana al BPM del backing track.
+    La variable "bpm_original" es el BPM de referencia del backing track.
+    Si el bpm_original es nulo, no cambia el bpm actual.
     """
     if bpm_original is None or not np.isfinite(bpm_original) or bpm_original <= 0:
         return bpm
@@ -101,9 +53,7 @@ def _octave_correct(bpm: float, bpm_original: float | None) -> float:
     return min(candidates, key=lambda x: abs(x - bpm_original))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN ESTIMATOR
-# ═══════════════════════════════════════════════════════════════════════════════
+# ESTIMADOR PRINCIPAL
 
 
 def estimate_bpm(
@@ -113,22 +63,19 @@ def estimate_bpm(
     logger: Logger | None = None,
 ) -> tuple[float | None, dict]:
     """
-    Estimate BPM from a buffer of audio samples.
-
+    Estima el BPM de un buffer de audio
     Returns
     -------
     (bpm_corr, debug_dict)
-    bpm_corr is the single-window octave-corrected estimate before median
-    filtering.  Returns None when the buffer is too short, too quiet, or
-    the autocorrelation produces an invalid peak.
-    Smoothing (median filter) is handled in bpm_analysis_thread so the
-    rolling window persists across calls.
+    bpm_corr es la estimación de una ventana (con correción de octava) antes del filtro de mediana.
+    Retorna None cuando el buffer es demasiado corto, demasiado silencioso, o la autocorrelación produce un pico inválido.
+    El suavizado (Filtro de mediana) es abordado en bpm_analysis_thread, para que la ventana de tiempo persista entre llamadas.
     """
     min_bpm = CFG.min_bpm
     max_bpm = CFG.max_bpm
 
     if len(y) < sr * 2:
-        return None, {"msg": "buffer too short"}
+        return None, {"msg": "buffer demasiado corto"}
 
     y = librosa.util.normalize(y.astype(np.float32))
     y = _apply_bandpass(y, sr, *BANDPASS)
@@ -140,7 +87,7 @@ def estimate_bpm(
     )
 
     if onset.size < 8 or np.max(onset) < 1e-3:
-        return None, {"msg": "weak onset"}
+        return None, {"msg": "ataque débil"}
 
     # Slice from centre of full correlogram — correct for even-length arrays.
     ac_full = np.correlate(onset, onset, mode="full")
@@ -150,11 +97,11 @@ def estimate_bpm(
     lag_max = min(int(np.ceil(60.0 * sr / (min_bpm * HOP_LENGTH))), len(ac) - 1)
 
     if lag_min >= lag_max:
-        return None, {"msg": "invalid range"}
+        return None, {"msg": "rango inválido"}
 
     lag = _pick_peak(ac, lag_min, lag_max)
     if lag is None or not np.isfinite(lag) or lag <= 0:
-        return None, {"msg": "invalid lag"}
+        return None, {"msg": "lag inválido"}
 
     bpm_raw = 60.0 * sr / (HOP_LENGTH * lag)
     bpm_corr = float(np.clip(_octave_correct(bpm_raw, bpm_original), min_bpm, max_bpm))
@@ -172,33 +119,15 @@ def estimate_bpm(
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ANALYSIS THREAD
-# ═══════════════════════════════════════════════════════════════════════════════
+# THREAD DE ANÁLISIS
 
 
 def bpm_analysis_thread(state: PhantomState, logger: Logger):
-    """
-    Runs in a daemon thread.  Every CFG.analyze_every seconds it:
-      1. Gates on RMS — skips silences entirely.
-      2. Calls estimate_bpm() to get a single-window BPM estimate.
-      3. Pushes it into a rolling deque and outputs the median — this
-         rejects spikes without the lag that exponential smoothing causes.
-      4. Writes the result to state via apply_audio_bpm(), unless
-         CFG.use_tempo_tapper is True (tap input owns BPM in that mode).
 
-    Median window
-    -------------
-    CFG.bpm_median_window (default 8) controls the trade-off:
-      • Larger → more spike rejection, slower response to real tempo changes.
-      • Smaller → faster response, more susceptible to single bad estimates.
-    At CFG.analyze_every=0.25s, a window of 8 covers the last 2 seconds.
-    """
     last = 0.0
     tapper_was_active = False
 
-    # Rolling window of octave-corrected single-window estimates.
-    # Median of this window is what gets written to state.
+    # Ventana rotativa de estimaciones.
     bpm_window: collections.deque[float] = collections.deque(
         maxlen=CFG.get("bpm_median_window", 8)
     )
@@ -207,7 +136,7 @@ def bpm_analysis_thread(state: PhantomState, logger: Logger):
         analyze_every = CFG.analyze_every
         now = time.time()
 
-        # Keep window size in sync with live config without recreating deque.
+        # Para mantener el tamaño de la ventana en sincronía con la configuración sin recrear el deque (en buffers.py)
         new_window_size = CFG.get("bpm_median_window", 8)
         if new_window_size != bpm_window.maxlen:
             bpm_window = collections.deque(bpm_window, maxlen=new_window_size)
@@ -216,16 +145,16 @@ def bpm_analysis_thread(state: PhantomState, logger: Logger):
             last = now
             y = np.array(audio_buffer, dtype=np.float32)
 
-            # ── RMS gate — skip analysis in silence ───────────────────────────
+            # RMS gate — Umbral de silencio
             rms = float(np.sqrt(np.mean(y**2)))
             rms_threshold = CFG.get("rms_threshold", 0.01)
             if rms < rms_threshold:
-                logger.debug(f"bpm-analysis: silent (rms={rms:.4f} < {rms_threshold})")
+                # logger.debug(f"bpm-analysis: silent (rms={rms:.4f} < {rms_threshold})")
                 with state._lock:
                     state.buffer_fill = min(1.0, len(audio_buffer) / (SR * 10))
                 continue
 
-            # ── Estimate ──────────────────────────────────────────────────────
+            # Estimación
             bpm_new, dbg = estimate_bpm(
                 y,
                 bpm_original=state.bpm_original,
@@ -236,19 +165,18 @@ def bpm_analysis_thread(state: PhantomState, logger: Logger):
 
             if tapper_active and not tapper_was_active:
                 logger.info(
-                    "bpm-analysis: tempo tapper enabled — audio BPM writes paused"
+                    "bpm-analysis: tempo tapper activado — Escritura de BPM de audio pausada"
                 )
             elif tapper_was_active and not tapper_active:
                 logger.info(
-                    "bpm-analysis: tempo tapper disabled — resuming audio BPM writes"
+                    "bpm-analysis: tempo tapper desactivado — Reanudando escritura de BPM de audio"
                 )
             tapper_was_active = tapper_active
 
             if bpm_new is not None and np.isfinite(bpm_new):
                 state.last_bpm_analysis_dbg = dbg
 
-                # ── Median filter — spike-resistant smoothing ──────────────────
-                # One outlier in a window of 8 is outvoted and has zero effect.
+                # Filtro de Mediana
                 bpm_window.append(bpm_new)
                 bpm_smooth = float(np.median(bpm_window))
 

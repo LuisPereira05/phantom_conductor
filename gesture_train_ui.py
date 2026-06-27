@@ -1,17 +1,3 @@
-"""
-gesture_train_ui.py
-===================
-DearPyGUI mixin for clip-based gesture training.
-
-Replaces the snapshot "Capture Sample" workflow with:
-  [START SESSION]  →  [● REC] (hold while moving hand)  →  [■ STOP CLIP]
-                       repeat from different angles       →  [SAVE GESTURE]
-
-The vision thread checks  self.state.clip_recording_active  each frame
-and calls  TRAINER.capture_frame(lm)  whenever it is True.
-(Previously it checked  capture_sample_requested; that flag is gone.)
-"""
-
 import dearpygui.dearpygui as dpg
 
 from gesture_trainer import MIN_CLIPS, TRAINER
@@ -41,29 +27,16 @@ _C = {
     "red_faint": (45, 16, 16, 255),
 }
 
-# How many frames the progress bar is calibrated to (cosmetic only)
+# Cuantos fotogramas la barra de progreso "requiere" (cosmético)
 _FRAMES_TARGET = 300  # 5 clips × ~60 frames each
 
 
 class GestureTrainUI:
-    """
-    Mixin for PhantomUI.
-    Requires self.state (PhantomState) and self.logger (Logger).
-
-    PhantomState must expose:
-        state.clip_recording_active : bool   (read by vision thread)
-
-    Call once during setup:   _build_train_popup()
-    Call every render frame:  _update_train_ui()
-    """
-
-    # ── Setup ─────────────────────────────────────────────────────────────────
-
     def _build_train_popup(self):
         self._train_last_sig: tuple = ()
 
         with dpg.window(
-            label="Gesture Trainer",
+            label="Entrenar Gestos",
             tag="train_win",
             width=580,
             height=480,
@@ -72,20 +45,20 @@ class GestureTrainUI:
             on_close=self._cb_train_close,
             pos=(420, 180),
         ):
-            # ── Header ────────────────────────────────────────────────────────
-            dpg.add_text("NEW GESTURE", color=_C["amber"])
+            # Header
+            dpg.add_text("NUEVO GESTO", color=_C["amber"])
             dpg.add_separator()
             dpg.add_spacer(height=4)
 
             with dpg.group(horizontal=True):
                 with dpg.group(width=180):
-                    dpg.add_text("Name (UPPER_SNAKE)", color=_C["dim"])
+                    dpg.add_text("Nombre (UPPER_SNAKE)", color=_C["dim"])
                     dpg.add_input_text(
-                        tag="train_name_input", hint="e.g. THUMBS_UP", width=172
+                        tag="train_name_input", hint="ej. THUMBS_UP", width=172
                     )
                 dpg.add_spacer(width=8)
                 with dpg.group(width=160):
-                    dpg.add_text("Mapped command", color=_C["dim"])
+                    dpg.add_text("Comando mapeado", color=_C["dim"])
                     dpg.add_combo(
                         items=_ALL_CMDS,
                         tag="train_cmd_combo",
@@ -97,14 +70,14 @@ class GestureTrainUI:
                     dpg.add_spacer(height=17)
                     with dpg.group(horizontal=True):
                         dpg.add_button(
-                            label=" START SESSION ",
+                            label=" COMENZAR SESIÓN ",
                             tag="train_start_btn",
                             callback=self._cb_train_start,
                             width=110,
                         )
                         dpg.add_spacer(width=4)
                         dpg.add_button(
-                            label=" CANCEL ",
+                            label=" CANCELAR ",
                             tag="train_cancel_btn",
                             callback=self._cb_train_cancel,
                             width=76,
@@ -112,34 +85,33 @@ class GestureTrainUI:
 
             dpg.add_spacer(height=10)
 
-            # ── Instructions ──────────────────────────────────────────────────
+            # Instrucciones
             dpg.add_text(
-                "Record several short clips (2-3 s each) from different angles "
-                "and distances.",
+                "Grabe varios clips desde diferentes ángulos y distancias ",
                 color=_C["dim"],
             )
             dpg.add_text(
-                f"You need at least {MIN_CLIPS} clips before you can save.",
+                f"Necesitas al menos {MIN_CLIPS} clips antes que puedas guardar",
                 color=_C["dim"],
             )
             dpg.add_spacer(height=6)
 
-            # ── Clip counter + progress ───────────────────────────────────────
-            dpg.add_text("— not recording —", tag="train_status_text", color=_C["dim"])
+            # Contador de clips y progreso
+            dpg.add_text("— no grabando —", tag="train_status_text", color=_C["dim"])
             dpg.add_spacer(height=4)
             dpg.add_progress_bar(
                 tag="train_progress",
                 default_value=0.0,
                 width=-1,
                 height=14,
-                overlay=f"0 clips  |  0 frames",
+                overlay=f"0 clips  |  0 fotogramas",
             )
             dpg.add_spacer(height=6)
 
-            # ── REC / STOP buttons ────────────────────────────────────────────
+            # Botones
             with dpg.group(horizontal=True):
                 dpg.add_button(
-                    label="  ● REC  ",
+                    label="  GRABAR  ",
                     tag="train_rec_btn",
                     callback=self._cb_train_rec,
                     width=120,
@@ -148,7 +120,7 @@ class GestureTrainUI:
                 )
                 dpg.add_spacer(width=8)
                 dpg.add_button(
-                    label="  ■ STOP CLIP  ",
+                    label="  PARAR CLIP  ",
                     tag="train_stop_btn",
                     callback=self._cb_train_stop,
                     width=140,
@@ -158,9 +130,9 @@ class GestureTrainUI:
 
             dpg.add_spacer(height=6)
 
-            # ── Save ──────────────────────────────────────────────────────────
+            # Guardar
             dpg.add_button(
-                label="  SAVE GESTURE  ",
+                label="  GUARDAR GESTO  ",
                 tag="train_save_btn",
                 callback=self._cb_train_save,
                 width=-1,
@@ -171,17 +143,19 @@ class GestureTrainUI:
             dpg.add_spacer(height=10)
             dpg.add_separator()
 
-            # ── Saved gesture list ────────────────────────────────────────────
-            dpg.add_text("SAVED GESTURES", color=_C["amber"])
+            # Lista de gestos guardados
+            dpg.add_text("GESTOS GUARDADOS", color=_C["amber"])
             dpg.add_spacer(height=4)
             with dpg.child_window(tag="train_list_outer", height=-1, border=False):
                 dpg.add_text(
-                    "— none saved yet —", tag="train_empty_label", color=_C["dim"]
+                    "- ningún gesto guardado -",
+                    tag="train_empty_label",
+                    color=_C["dim"],
                 )
 
         self._train_refresh_list()
 
-    # ── Open / close ──────────────────────────────────────────────────────────
+    # Abrir / Cerrar
 
     def _cb_train_open(self):
         dpg.show_item("train_win")
@@ -190,16 +164,16 @@ class GestureTrainUI:
     def _cb_train_close(self):
         if TRAINER.is_recording():
             TRAINER.cancel_recording()
-            self.logger.info("trainer: cancelled (window closed)")
+            self.logger.info("trainer: cancelado (ventana cerrada)")
         self.state.clip_recording_active = False
         self._train_reset_ui()
 
-    # ── Session controls ──────────────────────────────────────────────────────
+    # Controles de sesión
 
     def _cb_train_start(self):
         name = dpg.get_value("train_name_input").strip().upper()
         if not name:
-            self._set_status("⚠  Enter a gesture name first", _C["red"])
+            self._set_status("!! Digite un nombre para el gesto primero", _C["red"])
             return
         if TRAINER.is_recording():
             TRAINER.cancel_recording()
@@ -210,37 +184,36 @@ class GestureTrainUI:
         dpg.configure_item("train_stop_btn", enabled=False)
         dpg.configure_item("train_save_btn", enabled=False)
         self._set_status(
-            f"Session open: '{name}'  —  press ● REC to start a clip", _C["cyan"]
+            f"Session open: '{name}'  - presione GRABAR para empezar un clip",
+            _C["cyan"],
         )
-        self.logger.info(f"trainer: session started for '{name}'")
+        self.logger.info(f"trainer: sesión iniciada para '{name}'")
 
     def _cb_train_cancel(self):
         if TRAINER.is_recording():
             name = TRAINER.recording_name() or "?"
             TRAINER.cancel_recording()
-            self.logger.info(f"trainer: cancelled '{name}'")
+            self.logger.info(f"trainer: cancelado '{name}'")
         self.state.clip_recording_active = False
         self._train_reset_ui()
 
-    # ── Clip controls ─────────────────────────────────────────────────────────
+    # Controles de clip
 
     def _cb_train_rec(self):
-        """Begin a new clip."""
         if not TRAINER.is_recording():
             return
         if TRAINER.is_clip_active():
-            return  # already recording; ignore double-press
+            return
         TRAINER.start_clip()
         self.state.clip_recording_active = True
         dpg.configure_item("train_rec_btn", enabled=False)
         dpg.configure_item("train_stop_btn", enabled=True)
         self._set_status(
-            f"● Recording clip {TRAINER.clip_count() + 1}  —  move your hand naturally",
+            f"Grabando clip {TRAINER.clip_count() + 1}  - mueva su mano naturalmente",
             _C["red"],
         )
 
     def _cb_train_stop(self):
-        """End the current clip and bank it."""
         if not TRAINER.is_clip_active():
             return
         self.state.clip_recording_active = False
@@ -256,17 +229,17 @@ class GestureTrainUI:
 
         if can_save:
             self._set_status(
-                f"✓  {clips} clips ({frames} frames)  —  ready to save or add more",
+                f"{clips} clips ({frames} frames)  - listo para guardar o añadir más clips",
                 _C["green"],
             )
         else:
             remaining = MIN_CLIPS - clips
             self._set_status(
-                f"Clip {clips} saved ({frames} frames total)  —  "
-                f"record {remaining} more clip(s) from a different angle",
+                f"Clip {clips} guardado ({frames} frames total)  "
+                f"grabe {remaining} clips más desde un ángulo distinto",
                 _C["cyan"],
             )
-        self.logger.info(f"trainer: clip {clips} banked ({frames} frames total)")
+        self.logger.info(f"trainer: clip {clips} guardado ({frames} frames total)")
 
     def _cb_train_save(self):
         if not TRAINER.is_recording():
@@ -274,20 +247,19 @@ class GestureTrainUI:
         clips = TRAINER.clip_count()
         if clips < MIN_CLIPS:
             self._set_status(
-                f"⚠  Need {MIN_CLIPS} clips; only {clips} recorded", _C["red"]
+                f"!! Se necesitan {MIN_CLIPS} clips; solo {clips} grabados", _C["red"]
             )
             return
         cmd = dpg.get_value("train_cmd_combo")
         name = TRAINER.finish(command=cmd)
-        self.logger.ok(f"trainer: saved '{name}' → {cmd}")
-        self._set_status(f"✓  Saved '{name}'  ({cmd})", _C["green"])
+        self.logger.ok(f"trainer: guardado '{name}' → {cmd}")
+        self._set_status(f" Guardado '{name}'  ({cmd})", _C["green"])
         self._train_reset_ui()
         self._train_refresh_list()
 
-    # ── Per-frame update ──────────────────────────────────────────────────────
+    # Actualización
 
     def _update_train_ui(self):
-        """Call once per render frame from PhantomUI.run()."""
         if not dpg.is_item_shown("train_win"):
             return
 
@@ -310,16 +282,15 @@ class GestureTrainUI:
                 overlay=f"{clips} clip{'s' if clips != 1 else ''}  |  {frames} frames",
             )
             if active:
-                # Pulse the status line with a live frame counter
                 self._set_status(
-                    f"● Recording clip {clips + 1}  "
+                    f"Grabando clip {clips + 1}  "
                     f"—  {len(TRAINER._clip_vectors) if hasattr(TRAINER, '_clip_vectors') else '?'} frames",
                     _C["red"],
                 )
 
         self._train_refresh_list()
 
-    # ── Gesture list ──────────────────────────────────────────────────────────
+    # Lista de gestos
 
     def _train_refresh_list(self):
         try:
@@ -380,10 +351,10 @@ class GestureTrainUI:
 
     def _cb_train_delete(self, sender, app_data, user_data):
         TRAINER.delete(user_data)
-        self.logger.info(f"trainer: deleted '{user_data}'")
+        self.logger.info(f"trainer: eliminado '{user_data}'")
         self._train_refresh_list()
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # Helpers
 
     def _set_status(self, text: str, color: tuple):
         dpg.set_value("train_status_text", text)

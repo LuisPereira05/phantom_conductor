@@ -1,36 +1,3 @@
-"""
-Phantom Conductor — Audio Processing & Track Loader
-====================================================
-Responsibilities
-----------------
-* load_track          : loads any audio file via librosa; reads BPM from
-                        metadata tag or falls back to beat_track estimation.
-* backing_track_thread: beat-by-beat playback loop with live time-stretching
-                        (pyrubberband).  Reads live BPM from PhantomState,
-                        stretches each beat block to match, and pushes it to
-                        the shared audio_queue for audio_playback to drain.
-
-This module reads from PhantomState (BPM, gain, flags) and writes only
-track-progress fields (position, duration, bpm_original).
-It does NOT touch sounddevice directly — that is audio_input's job.
-
-Changes from v0.5.2
----------------------
-* backing_track_thread now actually consumes state.skip_to_next /
-  state.skip_to_prev. Previously state.dispatch_command("next"/"prev")
-  only set these flags — nothing downstream ever read them, so gesture-
-  or tap-triggered next/prev silently did nothing even though the
-  dispatch itself worked correctly (visible in the log as
-  "gesture [...] POINT -> next" with no actual track change).
-* The flag is read-and-cleared under the lock in one step, the same
-  pattern already used for load_new_track, so a gesture firing twice
-  in quick succession can't queue up two skips. Routed through
-  state.queue.next_track() / prev_track() — the same calls the UI's
-  Prev/Next buttons already use — so behavior stays consistent
-  regardless of whether the skip came from a button, a gesture, or
-  (in the future) a second tapper input.
-"""
-
 import os
 import time
 
@@ -54,19 +21,17 @@ try:
     HAS_PYRB = True
 except ImportError:
     HAS_PYRB = False
-    print("[warn] pyrubberband not found — time-stretch disabled")
+    print("[warn] pyrubberband no fue encontrado — time-stretch deshabilitado")
 
 MIN_BPM = 60
 MAX_BPM = 200
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  BPM TAG READER
-# ═══════════════════════════════════════════════════════════════════════════════
+# LECTOR DE BPM TAG
 
 
 def _read_bpm_tag(path: str) -> float | None:
-    """Try every known BPM tag field across formats (requires mutagen)."""
+    """Prueba todos los tags de BPM conocidos (requiere mutagen)"""
     if not HAS_MUTAGEN:
         return None
     try:
@@ -88,13 +53,11 @@ def _read_bpm_tag(path: str) -> float | None:
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  BPM ESTIMATOR FALLBACK
-# ═══════════════════════════════════════════════════════════════════════════════
+# ESTIMADOR DE BPM (en caso el archivo no tenga tag BPM)
 
 
 def _estimate_bpm_from_file(y: np.ndarray, sr: int, logger: Logger) -> float | None:
-    """Use librosa beat tracker as a fallback for untagged files."""
+    """Usa el tracker de beats como "plan b"."""
     try:
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
         if hasattr(tempo, "__len__"):
@@ -107,30 +70,20 @@ def _estimate_bpm_from_file(y: np.ndarray, sr: int, logger: Logger) -> float | N
             if candidate and MIN_BPM <= candidate <= MAX_BPM:
                 return float(candidate)
     except Exception as e:
-        logger.warn(f"librosa beat_track failed: {e}")
+        logger.warn(f"librosa beat_track falló: {e}")
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  TRACK LOADER
-# ═══════════════════════════════════════════════════════════════════════════════
+# TRACK LOADER
 
 
 def load_track(
     path: str, state: PhantomState, logger: Logger
 ) -> tuple[np.ndarray, float, float]:
     """
-    Load any supported audio file via librosa.
+    Carga cualquier archivo de audio soportado por librosa.
 
-    BPM priority
-    ------------
-    1. UI-supplied BPM already stored in state.bpm_original
-    2. Metadata tag in the file (TBPM / bpm / …)
-    3. librosa beat_track estimation
-    4. Fall back to state.bpm_original (default 120)
-
-    Returns
-    -------
+    Retorna:
     (samples_float32, bpm_original, duration_seconds)
     """
     logger.info(f"loading: {os.path.basename(path)}")
@@ -142,35 +95,30 @@ def load_track(
 
     tag_bpm = _read_bpm_tag(path)
     if tag_bpm:
-        logger.ok(f"BPM from tag: {tag_bpm:.1f}")
+        logger.ok(f"Tag BPM encontrado: {tag_bpm:.1f}")
 
     if tag_bpm is None:
-        logger.info("no BPM tag — running beat tracker…")
+        logger.info("Sin tag BPM, ejecutando estimación de BPM...")
         tag_bpm = _estimate_bpm_from_file(y, SR, logger)
         if tag_bpm:
-            logger.ok(f"BPM from beat_track: {tag_bpm:.1f}")
+            logger.ok(f"BPM estimado: {tag_bpm:.1f}")
         else:
-            logger.warn(f"beat_track failed — using ref BPM {ui_bpm:.1f}")
+            logger.warn(f"Estimación fallida, usando referencia manual: {ui_bpm:.1f}")
 
     bpm_orig = tag_bpm if tag_bpm else ui_bpm
-    logger.ok(f"track ready: {dur:.1f}s  bpm_ref={bpm_orig:.1f}")
+    logger.ok(f"track listo: {dur:.1f}s  bpm_ref={bpm_orig:.1f}")
     return y.astype(np.float32), bpm_orig, dur
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  BACKING TRACK THREAD
-# ═══════════════════════════════════════════════════════════════════════════════
+# THREAD DE BACKING TRACK
 
 
 def _consume_skip_flags(state: PhantomState) -> str | None:
     """
-    Atomically read-and-clear state.skip_to_next / skip_to_prev.
+    Automaticamente leer y eliminar flags de "next" (state.skip_to_next) o "prev" (skip_to_prev).
 
-    Returns "next", "prev", or None. If somehow both were set in the
-    same tick (e.g. two gestures landed back-to-back), "next" wins and
-    "prev" is dropped — an arbitrary but harmless tiebreak, since this
-    should essentially never happen in practice given gesture hold
-    times are much longer than one loop iteration.
+    Retorna "next", "prev", o None.
+    Si ambas flags son seteadas en el mismo tick, se prioriza "next".
     """
     with state._lock:
         nxt = state.skip_to_next
@@ -186,27 +134,21 @@ def _consume_skip_flags(state: PhantomState) -> str | None:
 
 def backing_track_thread(state: PhantomState, logger: Logger):
     """
-    Waits for a track signal (state.load_new_track), loads it, then plays
-    beat-by-beat with live time-stretching.  Respects PLAY/PAUSE.
-    When a track ends it auto-advances the queue (or loops if is_looping).
-
-    Also honours state.skip_to_next / state.skip_to_prev, set by
-    state.dispatch_command("next"/"prev") — e.g. from a trained gesture
-    or the UI's Prev/Next buttons.  Checked every iteration, even while
-    paused or idle, so a skip request is never silently dropped.
+    Espera una señal de track de state (state.load_new_track), lo carga al buffer y reproduce con time-stretching.
+    Respeta señales del usuario.
+    All terminar un track, pasa al siguiente o repite si is_looping == true.
 
     Phase-lock loop (PLL)
-    ---------------------
-    Each beat, any new timestamps from state.recent_beat_times are fed into
-    a PhaseLock instance.  It compares each detected beat against the
-    extrapolated grid, gates outliers beyond ±half-beat, averages the last
-    few accepted deltas, and returns a small rate multiplier that nudges
-    playback toward phase-lock over ~10 beats.  The final stretch rate is:
+
+    En cada beat, nuevos marcadores de tiempo son registrados en una instancia de PhaseLock (phase_lock.py).
+    Compara cada marcador detectado con una grilla extrapolada basada en detecciones anteriores.
+    Se eliminan variaciones altas (más de +- media duración de un beat extrapolado).
+    Se promedian las últimas n variaciones y retorna un multiplicador que mueve la velocidad de reproducción gradualmente durante 10 beats aprox.
+    El cálculo del multiplicador final es:
 
         rate = (bpm_live / bpm_orig) * pll.rate_correction
 
-    The PLL resets whenever a new track loads so stale phase error from the
-    previous track doesn't bleed into the next one.
+    Se resetea el PLL cada vez que se carga un nuevo track para eliminar error de fase del track anterior.
     """
     from phase_lock import PhaseLock
 
@@ -215,11 +157,13 @@ def backing_track_thread(state: PhantomState, logger: Logger):
     pos = 0
     t_next = time.time()
 
+    filtered_rate = 1.0
+
     pll = PhaseLock(logger=logger)
-    last_seen_beat: float | None = None  # newest beat timestamp already fed to PLL
+    last_seen_beat: float | None = None
 
     while state.alive():
-        # ── Check for a manual skip request (gesture / tapper / UI) ───────────
+        # Requesiciones del usuario
         skip = _consume_skip_flags(state)
         if skip:
             next_t = (
@@ -232,7 +176,7 @@ def backing_track_thread(state: PhantomState, logger: Logger):
             else:
                 logger.info(f"skip: {skip} requested but queue has no track")
 
-        # ── Check for a new track to load ─────────────────────────────────────
+        # Checkear nuevos tracks que cargar
         with state._lock:
             new_track = state.load_new_track
             if new_track:
@@ -263,28 +207,28 @@ def backing_track_thread(state: PhantomState, logger: Logger):
                 state.play()
                 logger.ok(f"playing: {new_track['name']}  BPM={bpm_orig:.1f}")
 
-                # Reset PLL — stale phase error from the previous track is
-                # meaningless for the new one.
+                # Resetea el PLL
                 pll.reset()
                 last_seen_beat = None
+                filtered_rate = 1.0
 
             except Exception as e:
                 logger.err(f"failed to load track: {e}")
                 y_full = None
                 new_track = None
 
-        # ── Idle ──────────────────────────────────────────────────────────────
+        # Sin cambios
         if y_full is None:
             time.sleep(0.05)
             continue
 
-        # ── Paused ────────────────────────────────────────────────────────────
+        # Pausado
         if not state.playing():
             time.sleep(0.05)
             t_next = time.time()
             continue
 
-        # ── Track finished ────────────────────────────────────────────────────
+        # Track finalizado
         if pos >= len(y_full):
             logger.ok("track finished")
             with state._lock:
@@ -310,48 +254,62 @@ def backing_track_thread(state: PhantomState, logger: Logger):
                     logger.info("queue empty — stopped")
             continue
 
-        # ── Build one beat block ───────────────────────────────────────────────
+        # Construcción de bloque de audio
         safe_orig = max(1.0, bpm_orig)
         beat_size = int(60.0 / safe_orig * SR)
-        end = min(pos + beat_size, len(y_full))
+
+        window_size = beat_size * 2
+
+        start = pos
+        end = min(start + window_size, len(y_full))
 
         with state._lock:
             gain = state.gain
 
-        block = y_full[pos:end] * gain
+        block = y_full[start:end] * gain
+
         bpm_live = state.get_bpm() or safe_orig
 
-        # ── Feed new detected beats into the PLL ──────────────────────────────
-        # recent_beat_times is a deque(maxlen=4) written by the audio-analysis
-        # thread.  We snapshot it, then feed only timestamps we haven't seen yet
-        # (newer than last_seen_beat) so each real beat is counted exactly once.
+        # Almacenar nuevos beats detectados al PLL
         for bt in list(state.recent_beat_times):
             if last_seen_beat is None or bt > last_seen_beat:
                 pll.update(beat_time=bt, bpm=bpm_live)
                 last_seen_beat = bt
 
-        # ── Compute stretch rate with phase correction ─────────────────────────
-        # pll.rate_correction is 1.0 until the PLL has seen enough beats to form
-        # a phase estimate, so there is no effect during the first few seconds.
-        rate = (bpm_live / safe_orig) * pll.rate_correction
+        # Cálculo del multiplicador (rate) con corrección de fase
+        target_rate = (bpm_live / safe_orig) * pll.rate_correction
 
-        # Time-stretch
+        alpha = 0.15
+        filtered_rate += alpha * (target_rate - filtered_rate)
+        rate = filtered_rate
+
         if HAS_PYRB and len(block) > 512 and abs(rate - 1.0) > 0.005:
             try:
                 block = pyrb.time_stretch(block, SR, rate)
             except Exception as e:
                 logger.warn(f"time-stretch: {e}")
 
-        # Wait until scheduled beat time
+        ratio = len(block) / (end - start)
+
+        first_beat_len = int(beat_size * ratio)
+        first_beat_len = min(first_beat_len, len(block))
+
+        play_block = block[:first_beat_len]
+
+        # Esperar hasta el próximo beat
         wait = t_next - time.time()
         if wait > 0:
             time.sleep(wait)
 
         try:
-            audio_queue.put_nowait(block.astype(np.float32))
+            audio_queue.put_nowait(play_block.astype(np.float32))
         except Exception:
-            pass  # drop if full — stay in sync
+            pass
 
+        # Avanzar un beat en el track
         pos += beat_size
+
+        # Programar el tiempo del próximo beat
         t_next += 60.0 / max(1.0, bpm_live)
+
         state.set_position(pos / SR)

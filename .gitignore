@@ -3,3 +3,5 @@ venv/
 audio/*
 __pycache__/
 *.task
+training
+training_data
