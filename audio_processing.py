@@ -255,61 +255,36 @@ def backing_track_thread(state: PhantomState, logger: Logger):
             continue
 
         # Construcción de bloque de audio
+
         safe_orig = max(1.0, bpm_orig)
-        beat_size = int(60.0 / safe_orig * SR)
-
-        window_size = beat_size * 2
-
-        start = pos
-        end = min(start + window_size, len(y_full))
-
-        with state._lock:
-            gain = state.gain
-
-        block = y_full[start:end] * gain
-
         bpm_live = state.get_bpm() or safe_orig
+        rate = (bpm_live / safe_orig) * pll.rate_correction
 
-        # Almacenar nuevos beats detectados al PLL
-        for bt in list(state.recent_beat_times):
-            if last_seen_beat is None or bt > last_seen_beat:
-                pll.update(beat_time=bt, bpm=bpm_live)
-                last_seen_beat = bt
+        # How many OUTPUT samples per beat?
+        out_beat_size = int(60.0 / max(1.0, bpm_live) * SR)
 
-        # Cálculo del multiplicador (rate) con corrección de fase
-        target_rate = (bpm_live / safe_orig) * pll.rate_correction
+        # How many INPUT samples needed to produce out_beat_size output?
+        in_beat_size = int(out_beat_size * rate)
 
-        alpha = 0.15
-        filtered_rate += alpha * (target_rate - filtered_rate)
-        rate = filtered_rate
+        end = min(pos + in_beat_size, len(y_full))
+        block = y_full[pos:end] * state.gain
 
+        # Time-stretch this chunk
         if HAS_PYRB and len(block) > 512 and abs(rate - 1.0) > 0.005:
             try:
                 block = pyrb.time_stretch(block, SR, rate)
             except Exception as e:
                 logger.warn(f"time-stretch: {e}")
 
-        ratio = len(block) / (end - start)
-
-        first_beat_len = int(beat_size * ratio)
-        first_beat_len = min(first_beat_len, len(block))
-
-        play_block = block[:first_beat_len]
-
-        # Esperar hasta el próximo beat
+        # Wait and play
         wait = t_next - time.time()
         if wait > 0:
             time.sleep(wait)
-
         try:
-            audio_queue.put_nowait(play_block.astype(np.float32))
+            audio_queue.put_nowait(block.astype(np.float32))
         except Exception:
             pass
 
-        # Avanzar un beat en el track
-        pos += beat_size
-
-        # Programar el tiempo del próximo beat
-        t_next += 60.0 / max(1.0, bpm_live)
-
-        state.set_position(pos / SR)
+        pos += in_beat_size  # advance in INPUT space
+        t_next += len(block) / SR  # advance by actual playback duration
+        state.set_position(pos / SR)  # position tracking (approximate)

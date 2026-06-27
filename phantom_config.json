@@ -15,12 +15,12 @@
   "inference_skip_frames": 2,
   "use_pedal": false,
   "pedal_key": "space",
-  "use_tempo_tapper": true,
+  "use_tempo_tapper": false,
   "tap_key": "t",
   "smooth_alpha": 0.3,
   "min_bpm": 60,
   "max_bpm": 200,
   "analyze_every": 0.25,
-  "bpm_median_window": 8,
+  "bpm_median_window": 2,
   "rms_threshold": 0.03
 }

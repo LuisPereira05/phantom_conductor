@@ -70,6 +70,13 @@ def estimate_bpm(
     bpm_corr es la estimación de una ventana (con correción de octava) antes del filtro de mediana.
     Retorna None cuando el buffer es demasiado corto, demasiado silencioso, o la autocorrelación produce un pico inválido.
     El suavizado (Filtro de mediana) es abordado en bpm_analysis_thread, para que la ventana de tiempo persista entre llamadas.
+
+    debug_dict también incluye "onset_frame_times": tiempos (en segundos,
+    relativos al INICIO de `y`) de los picos individuales de onset detectados
+    en esta ventana — ver _detect_onset_times(). bpm_analysis_thread los
+    traduce a tiempo de reloj absoluto antes de escribirlos en
+    state.recent_beat_times; estimate_bpm() en sí no conoce el reloj de
+    pared, solo el buffer que se le pasó.
     """
     min_bpm = CFG.min_bpm
     max_bpm = CFG.max_bpm
@@ -106,6 +113,18 @@ def estimate_bpm(
     bpm_raw = 60.0 * sr / (HOP_LENGTH * lag)
     bpm_corr = float(np.clip(_octave_correct(bpm_raw, bpm_original), min_bpm, max_bpm))
 
+    # Picos de onset individuales dentro de esta ventana — independientes
+    # del cálculo de BPM por arriba (que usa la envolvente completa), pero
+    # reutiliza la misma envolvente "onset" para no correr onset_strength
+    # dos veces. units="frames" + frames_to_time evita perder precisión por
+    # redondeo a milisegundos en cada paso.
+    onset_frames = librosa.onset.onset_detect(
+        onset_envelope=onset, sr=sr, hop_length=HOP_LENGTH, units="frames"
+    )
+    onset_frame_times = librosa.frames_to_time(
+        onset_frames, sr=sr, hop_length=HOP_LENGTH
+    ).tolist()
+
     if logger is not None:
         logger.debug(
             f"bpm_raw={bpm_raw:.1f}  bpm_corr={bpm_corr:.1f}  "
@@ -116,6 +135,7 @@ def estimate_bpm(
         "bpm_raw": float(bpm_raw),
         "bpm_corr": bpm_corr,
         "onset_max": float(np.max(onset)),
+        "onset_frame_times": onset_frame_times,
     }
 
 
@@ -131,6 +151,14 @@ def bpm_analysis_thread(state: PhantomState, logger: Logger):
     bpm_window: collections.deque[float] = collections.deque(
         maxlen=CFG.get("bpm_median_window", 8)
     )
+
+    # Marca de tiempo (reloj de pared) del onset más reciente que ya fue
+    # empujado a state.recent_beat_times. Cada ventana de análisis se
+    # superpone con la anterior (el buffer es un deque rotativo de hasta
+    # BUFFER_SEC segundos, no un clip aislado), así que sin este guardia
+    # el mismo onset físico se reenviaría en cada pase mientras siga
+    # dentro del buffer — re-detectado, no un beat nuevo.
+    last_emitted_onset_wall_time: float | None = None
 
     while state.alive():
         analyze_every = CFG.analyze_every
@@ -189,6 +217,29 @@ def bpm_analysis_thread(state: PhantomState, logger: Logger):
                     )
                     if wrote:
                         state.last_bpm_dbg = dbg
+
+            # ── Emitir onsets nuevos a state.recent_beat_times ──────────
+            # Esto alimenta el PLL en audio_processing.backing_track_thread
+            # (vía phase_lock.PhaseLock.update()), que de otro modo nunca
+            # recibe un solo beat — recent_beat_times no se escribía en
+            # ningún lado antes de este parche.
+            #
+            # y[] fue tomado de audio_buffer en el momento `now`, así que
+            # su última muestra corresponde a wall-clock `now` y su primera
+            # muestra a `now - len(y)/SR`. onset_frame_times está en
+            # segundos relativos al INICIO de y[], así que se traduce
+            # sumando ese offset.
+            frame_times = dbg.get("onset_frame_times") if bpm_new is not None else None
+            if frame_times:
+                window_start_wall = now - (len(y) / SR)
+                for ft in frame_times:
+                    onset_wall_time = window_start_wall + ft
+                    if (
+                        last_emitted_onset_wall_time is None
+                        or onset_wall_time > last_emitted_onset_wall_time
+                    ):
+                        state.recent_beat_times.append(onset_wall_time)
+                        last_emitted_onset_wall_time = onset_wall_time
 
             with state._lock:
                 state.buffer_fill = min(1.0, len(audio_buffer) / (SR * 10))

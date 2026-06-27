@@ -28,12 +28,12 @@ _DEFAULTS: dict = {
     "use_tempo_tapper": False,
     "tap_key": "t",  # tecla "override" del tempo del pedal
     # ANÁLISIS DE BPM
-    "smooth_alpha": 0.4,  # razón de suavizado
+    "smooth_alpha": 0.3,  # razón de suavizado
     "min_bpm": 60,
     "max_bpm": 200,
     "analyze_every": 0.25,  # tiempo de espera para análisis.
-    "bpm_median_window": 8,  # cantidad de beats para análisis estadístico
-    "rms_threshold": 0.03,  # umbral de detección de transientes (picos)
+    "bpm_median_window": 4,  # cantidad de beats para análisis estadístico
+    "rms_threshold": 0.015,  # umbral de detección de transientes (picos)
 }
 
 
