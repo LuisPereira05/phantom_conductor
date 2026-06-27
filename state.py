@@ -1,40 +1,3 @@
-"""
-Phantom Conductor — Shared State & Track Queue
-===============================================
-Thread-safe data containers shared by all pipeline components.
-No I/O, no threads, no GUI — pure data.
-
-Changes from v0.5.1
---------------------
-* Added loop-section fields: loop_section_index, loop_sections (derived
-  from sorted markers), and helpers get_loop_section / step_loop_section.
-* Added dispatch_command() — single place that maps command strings
-  ("play", "pause", "next", "prev", "loop_toggle", "loop_next",
-  "loop_prev") to state mutations.  gesture_recognition calls this
-  instead of calling play()/pause() directly.
-* skip_to_next / skip_to_prev flags honoured by backing_track_thread.
-
-Changes from v0.5.2 (tempo tapper)
------------------------------------
-* Added a tap-override window: apply_tap_bpm() / apply_audio_bpm() let
-  manual foot-taps "win" over the smoothed audio BPM for a short
-  period, instead of having both writers fight over set_bpm().
-  set_bpm() itself is untouched so existing callers keep working.
-* Added tap_connected for the Settings/HUD panel to show serial status.
-
-Changes from v0.5.3 (tempo tapper gating fix)
------------------------------------------------
-* Added last_bpm_analysis_dbg — audio_analysis_thread now keeps this
-  updated every pass regardless of whether CFG.use_tempo_tapper gates
-  the actual write, so HUD/debug views don't go stale while tapper
-  mode is active.
-* apply_tap_bpm / apply_audio_bpm behaviour unchanged; the *live*
-  CFG.use_tempo_tapper check now lives in audio_analysis.py and
-  tempo_tapper.py themselves (checked every loop pass in both), so
-  the override window here is a secondary safety net rather than the
-  only thing keeping the two sources from fighting.
-"""
-
 import collections
 import threading
 import time
@@ -42,17 +5,15 @@ import time
 from config import CFG
 from tracklist import PersistentQueue
 
-# How long a manual tap takes priority over audio-derived BPM
 TAP_OVERRIDE_WINDOW_S = 4.0
 
 
 class PhantomState:
-    """Thread-safe container — worker threads write, UI reads every frame."""
+    """Contenedor thread-safe — los hilos de trabajo escriben, la UI lee cada frame."""
 
     def __init__(self):
         self._lock = threading.Lock()
 
-        # BPM
         self.bpm_live: float | None = None
         self.bpm_original: float = 120.0
         self.bpm_raw: float | None = None
@@ -61,30 +22,23 @@ class PhantomState:
         self.bpm_source: str = "audio"
         self.onset_max: float = 0.0
         self.last_bpm_dbg: dict = {}
-        self.last_bpm_analysis_dbg: dict = {}  # always fresh, even when
-        # tapper mode gates the write
+        self.last_bpm_analysis_dbg: dict = {}
         self._tap_override_until: float = 0.0
         self.recent_beat_times: collections.deque[float] = collections.deque(maxlen=4)
 
-        # Playback
         self.is_playing: bool = False
         self.is_looping: bool = False
         self.track_path: str = ""
         self.track_duration: float = 0.0
         self.track_position: float = 0.0
 
-        # Markers & loop sections
-        # markers: raw list of timestamps (seconds) added by user
-        # loop_section_index: which gap between markers is active (-1 = whole track)
         self.markers: list[float] = []
         self.loop_section_index: int = -1
 
-        # Signals to backing_track_thread
         self.load_new_track: dict | None = None
         self.skip_to_next: bool = False
         self.skip_to_prev: bool = False
 
-        # I/O
         self.dev_in: int | None = CFG.dev_in
         self.dev_out: int | None = CFG.dev_out
         self.gain: float = CFG.output_gain
@@ -92,13 +46,11 @@ class PhantomState:
         self.io_restart_requested: bool = False
         self.latest_frame = None
 
-        # Audio levels
         self.rms: float = 0.0
         self.peak: float = 0.0
         self.waveform: list[float] = [0.0] * 64
         self.buffer_fill: float = 0.0
 
-        # Gesture
         self.gesture_name: str = "NO HAND"
         self.gesture_confidence: float = 0.0
         self.gesture_hold_frames: int = 0
@@ -108,17 +60,14 @@ class PhantomState:
         self.hands_detected: int = 0
         self.camera_active: bool = False
 
-        # Tempo tapper (serial)
         self.tap_connected: bool = False
 
-        # System
         self.running: bool = True
         self.start_time: float = time.time()
 
-        # Persistent track queue
         self.queue: PersistentQueue = PersistentQueue()
 
-    # ── Playback ──────────────────────────────────────────────────────────────
+    # Reproducción
     def play(self):
         with self._lock:
             self.is_playing = True
@@ -140,7 +89,7 @@ class PhantomState:
         with self._lock:
             self.is_playing = v
 
-    # ── BPM ───────────────────────────────────────────────────────────────────
+    # BPM
     def get_bpm(self) -> float | None:
         with self._lock:
             return self.bpm_live
@@ -153,11 +102,10 @@ class PhantomState:
         onset_max: float = 0.0,
     ):
         """
-        Unconditional setter — unchanged behaviour for existing callers
-        (gesture HUD, manual UI overrides, etc.). Does NOT touch
-        bpm_source or the tap-override window; the two competing
-        writer threads should use apply_tap_bpm() / apply_audio_bpm()
-        instead so they don't stomp on each other.
+        Setter incondicional — comportamiento sin cambios para los callers
+        existentes (HUD de gestos, overrides manuales de UI, etc.). No toca
+        bpm_source ni la ventana de prioridad de tap; los dos hilos escritores
+        deben usar apply_tap_bpm() / apply_audio_bpm() para no pisarse.
         """
         with self._lock:
             self.bpm_live = bpm
@@ -168,9 +116,9 @@ class PhantomState:
 
     def apply_tap_bpm(self, bpm: float):
         """
-        Called by tempo_tapper_thread when a valid BPM: line arrives.
-        Always wins immediately, and opens a window during which
-        apply_audio_bpm() will refuse to overwrite it.
+        Llamado por tempo_tapper_thread cuando llega una línea BPM válida.
+        Siempre gana de inmediato y abre una ventana durante la cual
+        apply_audio_bpm() se negará a sobreescribirlo.
         """
         with self._lock:
             self.bpm_live = bpm
@@ -188,10 +136,9 @@ class PhantomState:
         onset_max: float = 0.0,
     ) -> bool:
         """
-        Called by bpm_analysis_thread instead of set_bpm() directly.
-        Returns False (no-op) while a recent manual tap is still inside
-        its override window, so the mic's smoothing doesn't immediately
-        erase what the foot just set. Returns True if it wrote the value.
+        Llamado por bpm_analysis_thread en lugar de set_bpm() directamente.
+        Retorna False (no-op) mientras un tap manual reciente esté dentro
+        de su ventana de prioridad. Retorna True si escribió el valor.
         """
         with self._lock:
             if time.time() < self._tap_override_until:
@@ -209,12 +156,13 @@ class PhantomState:
             self.bpm_original = bpm
             self.stretch_ratio = (self.bpm_live / bpm) if self.bpm_live and bpm else 1.0
 
-    # ── Markers & loop sections ───────────────────────────────────────────────
+    # Marcadores y secciones de loop
     def get_loop_sections(self) -> list[tuple[float, float]]:
         """
-        Return sorted adjacent pairs from markers, bookended by 0 and duration.
-        E.g. markers [10, 30] on a 60s track → [(0,10), (10,30), (30,60)]
-        Returns [] when there are no markers.
+        Retorna pares adyacentes ordenados de los marcadores, enmarcados
+        por 0 y la duración total.
+        Ej: marcadores [10, 30] en una pista de 60s → [(0,10), (10,30), (30,60)]
+        Retorna [] si no hay marcadores.
         """
         with self._lock:
             pts = sorted(set(self.markers))
@@ -226,8 +174,8 @@ class PhantomState:
 
     def get_active_loop_section(self) -> tuple[float, float] | None:
         """
-        Returns (start, end) of the currently selected loop section,
-        or None if loop_section_index is -1 (whole track).
+        Retorna (inicio, fin) de la sección de loop activa,
+        o None si loop_section_index es -1 (pista completa).
         """
         sections = self.get_loop_sections()
         with self._lock:
@@ -237,38 +185,35 @@ class PhantomState:
         return sections[idx % len(sections)]
 
     def step_loop_section(self, delta: int):
-        """Advance (+1) or rewind (-1) the active loop section."""
+        """Avanza (+1) o retrocede (-1) la sección de loop activa."""
         sections = self.get_loop_sections()
         if not sections:
             return
         with self._lock:
             if self.loop_section_index < 0:
-                # First activation: go to section 0 on next, last on prev
                 self.loop_section_index = 0 if delta > 0 else len(sections) - 1
             else:
                 self.loop_section_index = (self.loop_section_index + delta) % len(
                     sections
                 )
-            # Jump playhead to the start of the new section
             sec = sections[self.loop_section_index]
             self.track_position = sec[0]
 
-    # ── Command dispatcher ────────────────────────────────────────────────────
+    # Dispatcher de comandos
     def dispatch_command(self, cmd: str, logger=None) -> bool:
         """
-        Execute a transport command by name.  Returns True if handled.
+        Ejecuta un comando de transporte por nombre. Retorna True si fue manejado.
 
-        Supported commands
-        ------------------
-        play          — resume / start playback
-        pause         — pause playback
-        toggle        — flip play/pause
-        next          — load next track in queue
-        prev          — load previous track in queue
-        loop_toggle   — toggle loop on/off; if markers exist, activates
-                        loop-section mode (section 0) on first enable
-        loop_next     — advance to next loop section (enables loop if off)
-        loop_prev     — rewind to previous loop section (enables loop if off)
+        Comandos soportados
+
+        play          — reanudar / iniciar reproducción
+        pause          — pausar reproducción
+        toggle        — alternar play/pause
+        next          — cargar la siguiente pista de la cola
+        prev          — cargar la pista anterior de la cola
+        loop_toggle   — activar/desactivar loop; si hay marcadores, activa el modo de sección (sección 0) al primer activar
+        loop_next     — avanzar a la siguiente sección de loop (activa loop si estaba apagado)
+        loop_prev     — retroceder a la sección anterior (activa loop si estaba apagado)
         """
         cmd = cmd.lower().strip()
 
@@ -294,7 +239,7 @@ class PhantomState:
         elif cmd in ("loop_next", "loop_prev"):
             delta = 1 if cmd == "loop_next" else -1
             with self._lock:
-                self.is_looping = True  # implicitly enable loop
+                self.is_looping = True
             self.step_loop_section(delta)
         else:
             return False
@@ -306,7 +251,7 @@ class PhantomState:
             logger.info(f"cmd: {cmd}")
         return True
 
-    # ── Gesture ───────────────────────────────────────────────────────────────
+    # Gestos
     def set_gesture(
         self, name: str, confidence: float = 0.0, hold_frames: int = 0, hands: int = 1
     ):
@@ -326,7 +271,7 @@ class PhantomState:
             self.last_command = cmd
             self.pending_command = cmd
 
-    # ── Audio ─────────────────────────────────────────────────────────────────
+    # Audio
     def push_waveform(self, rms_val: float):
         with self._lock:
             v = min(1.0, float(rms_val))
@@ -340,7 +285,7 @@ class PhantomState:
         with self._lock:
             self.track_position = pos
 
-    # ── I/O ───────────────────────────────────────────────────────────────────
+    # I/O
     def request_io_restart(self, dev_in, dev_out, input_gain=None, output_gain=None):
         with self._lock:
             self.dev_in = dev_in
@@ -363,7 +308,7 @@ class PhantomState:
             self.io_restart_requested = False
             return self.dev_in, self.dev_out
 
-    # ── System ────────────────────────────────────────────────────────────────
+    # Sistema
     def stop(self):
         with self._lock:
             self.running = False
@@ -377,5 +322,5 @@ class PhantomState:
             d = self.__dict__.copy()
             d.pop("_lock", None)
             d.pop("queue", None)
-            d["recent_beat_times"] = list(self.recent_beat_times)  # deque → list
+            d["recent_beat_times"] = list(self.recent_beat_times)
             return d

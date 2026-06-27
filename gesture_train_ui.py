@@ -35,6 +35,8 @@ class GestureTrainUI:
     def _build_train_popup(self):
         self._train_last_sig: tuple = ()
 
+        
+
         with dpg.window(
             label="Entrenar Gestos",
             tag="train_win",

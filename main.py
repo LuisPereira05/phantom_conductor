@@ -1,39 +1,3 @@
-"""
-Phantom Conductor — Entry Point
-================================
-Starts all daemon threads and then hands the main thread to Dear PyGui.
-
-Thread map
-----------
-  bpm-analysis    → audio_analysis.bpm_analysis_thread
-  backing-track   → audio_processing.backing_track_thread
-  io-manager      → audio_input.io_manager_thread
-                      ├─ audio-in   → audio_input.input_thread
-                      └─ audio-out  → audio_input.playback_thread
-  gesture-vision  → gesture_recognition.gesture_vision_thread
-                      (internally uses video_input helpers)
-  tempo-tapper    → tempo_tapper.tempo_tapper_thread
-                      (reads BPM taps from the Arduino piezo over serial)
-
-Main thread → ui.PhantomUI.run()  (Dear PyGui must run on the main thread)
-
-Changes from v0.5.0
---------------------
-* Camera index now read from CFG (phantom_config.json) by default.
-  Command-line override still works: `python main.py 2`
-* Introduces config.py and tracklist.py as new dependencies.
-
-Changes from v0.5.2 (tempo tapper)
------------------------------------
-* Added the tempo-tapper daemon thread. It always starts — it does NOT
-  exit early if CFG.use_tempo_tapper is False, because the thread now
-  checks that flag live on every serial line (see tempo_tapper.py) so
-  the Settings checkbox can enable/disable it at runtime without a
-  restart. If no Arduino is plugged in, the thread just logs a
-  "no serial port found — retrying…" warning periodically and is
-  otherwise harmless to leave running.
-"""
-
 import threading
 
 from audio_analysis import bpm_analysis_thread
@@ -52,27 +16,21 @@ def main():
     print("  PHANTOM CONDUCTOR v0.5.3")
     print("=" * 58)
 
-    # Camera index: CLI arg overrides saved config
-    cam_prompt = f"  Camera index to use? (Enter = {CFG.cam_index}): "
-    print(cam_prompt, end="", flush=True)
-    cam_str = input().strip()
-    if cam_str.isdigit():
-        cam_idx = int(cam_str)
-        CFG.set("cam_index", cam_idx)
-    else:
-        cam_idx = CFG.cam_index
+    cam_idx = CFG.cam_index
 
     print()
-    print("  → Add tracks via the Queue panel (+ADD)")
-    print("  → Configure audio/video in the SETTINGS panel, then click APPLY")
-    print("  → Open hand = PLAY  |  Fist = PAUSE  |  Space = toggle  |  Q = quit")
-    print("  → Tempo tapper: tap the piezo, then enable it in SETTINGS")
+    print("  -> Añade tracks mediante el panel de la derecha")
+    print(
+        "  -> Configura el audio/video en el panel de configuración (PRESIONE 'APLICAR' PARA NOTAR LOS CAMBIOS)"
+    )
+    print("  -> Mano abierta = PLAY  |  Puño = PAUSE  |  Espacio = toggle  |  Q = quit")
+    print("  -> Tempo tapper: golpee el piezo, luego habilítelo en Configuración")
     print("=" * 58 + "\n")
 
     state = PhantomState()
     logger = Logger()
 
-    # ── Worker threads ─────────────────────────────────────────────────────────
+    # Threads
     threading.Thread(
         target=bpm_analysis_thread,
         args=(state, logger),
@@ -108,7 +66,7 @@ def main():
         name="tempo-tapper",
     ).start()
 
-    # ── UI — must run on the main thread ───────────────────────────────────────
+    # Interfaz
     ui = PhantomUI(state, logger)
     try:
         ui.run()

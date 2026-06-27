@@ -1,40 +1,3 @@
-"""
-gesture_trainer.py  -  rotation-invariant static gesture recognition
-======================================================================
-
-Optimizations over the previous version
------------------------------------------
-- Binary storage (.bin + .meta.json sidecar) instead of JSON.
-  - Float vectors stored as raw IEEE-754 float32 - no text parsing on load.
-  - 50-60% smaller on disk; load time drops from ~10-20 ms to <1 ms.
-  - .meta.json holds names/commands/clip counts (human-readable, tiny).
-
-- Cached, pre-normalized pool matrix (_PoolCache).
-  - Built ONCE after load or after finish(); never rebuilt inside match().
-  - Pool row norms are pre-computed at cache-build time - not per call.
-  - match() is a single BLAS matrix-vector multiply: pool_normed @ query
-
-- capture_frame stores vectors as np.ndarray rows (float32), not Python lists.
-
-Public API - fully backwards-compatible
------------------------------------------
-  TRAINER.start_recording(name)
-  TRAINER.start_clip()
-  TRAINER.stop_clip()
-  TRAINER.capture_frame(lm)
-  TRAINER.is_recording()
-  TRAINER.recording_name()
-  TRAINER.clip_count()
-  TRAINER.frame_count()
-  TRAINER.finish(command)
-  TRAINER.cancel_recording()
-  TRAINER.match(lm)               -> (name|None, score 0-1)
-  TRAINER.list_gestures()
-  TRAINER.delete(name)
-  TRAINER.set_command(name, command)
-  TRAINER.command_for(name)
-"""
-
 import json
 import math
 import os
@@ -44,19 +7,19 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-# -- File paths ----------------------------------------------------------------
+# Paths
 _DIR = os.path.dirname(__file__)
 TEMPLATE_PATH = os.path.join(_DIR, "gesture_templates.json")  # legacy (read-only)
 BINARY_DATA_PATH = os.path.join(_DIR, "gesture_pool.bin")
 BINARY_META_PATH = os.path.join(_DIR, "gesture_pool.meta.json")
 
-# -- Hyper-parameters ------------------------------------------------------------
+# Parámetros
 MIN_CLIPS = 3
-K_NEIGHBORS = 7  # must be odd
-MATCH_THRESHOLD = 0.82  # cosine similarity threshold
+K_NEIGHBORS = 7  # Impar
+MATCH_THRESHOLD = 0.82
 VECTOR_DIM = 19
 
-# -- Landmark indices ------------------------------------------------------------
+# Índices de Landmarks (MediaPipe)
 WRIST = 0
 THUMB_MCP, THUMB_IP, THUMB_TIP = 2, 3, 4
 INDEX_MCP, INDEX_PIP, INDEX_TIP = 5, 6, 8
@@ -65,9 +28,7 @@ RING_MCP, RING_PIP, RING_TIP = 13, 14, 16
 PINKY_MCP, PINKY_PIP, PINKY_TIP = 17, 18, 20
 
 
-# ===============================================================================
-#  FEATURE EXTRACTION  (19 floats, fully rotation-invariant)
-# ===============================================================================
+# EXTRACCIÓN DE FEATURES
 
 
 def _angle(v1: np.ndarray, v2: np.ndarray) -> float:
@@ -100,14 +61,14 @@ def _build_local_basis(lm: np.ndarray) -> np.ndarray:
 
 def extract_features(lm: np.ndarray) -> np.ndarray:
     """
-    Convert a (21, 3) landmark array into a 19-float feature vector.
+    Conversión de array (21, 3) a un vector de 19 floats
 
     Layout:
       [0:5]   extension ratios          (tip-MCP distance / palm scale)
       [5:10]  PIP curl angles           (radians, 0 = straight)
       [10:14] spread angles             (3 adjacent pairs + 1 outer pair)
       [14]    thumb opposition ratio
-      [15:19] fingertip pair distances  (normalised)
+      [15:19] fingertip pair distances  (normalized)
     """
     basis = _build_local_basis(lm)
     palm_scale = float(np.linalg.norm(lm[MIDDLE_MCP] - lm[WRIST]))
@@ -140,10 +101,6 @@ def extract_features(lm: np.ndarray) -> np.ndarray:
         feats.append(_angle(local[pip] - local[mcp], local[tip] - local[pip]))
 
     # Spread angles (4): 3 adjacent pairs + 1 outer pair (index-pinky).
-    # NOTE: range(len(bases) - 1) over 4 bases only yields 3 angles on its
-    # own - the outer pair below is what brings this to a true 4 and keeps
-    # VECTOR_DIM at 19. (A prior revision omitted it, producing 18-float
-    # vectors that silently failed to match against 19-dim pools.)
     bases = [INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP]
     for i in range(len(bases) - 1):
         feats.append(_angle(local[bases[i]], local[bases[i + 1]]))
@@ -164,9 +121,10 @@ def extract_features(lm: np.ndarray) -> np.ndarray:
     return np.array(feats, dtype=np.float32)
 
 
-# ===============================================================================
-#  BINARY I/O
-# ===============================================================================
+# BINARIO
+# Estructura (para no olvidarme):
+# .bin -> Header, descriptores, vectores float32
+# .json -> metadatos
 
 MAGIC = b"GPOL"
 
@@ -296,8 +254,8 @@ def _load_legacy_json():
 
             if arr.ndim != 2 or arr.shape[1] != VECTOR_DIM:
                 print(
-                    f"[trainer] '{name}': legacy pool has {arr.shape[1]}-float vectors "
-                    f"(current format is {VECTOR_DIM}) - pool discarded, RETRAIN NEEDED"
+                    f"[trainer] '{name}': pool anterior tiene {arr.shape[1]}-vectores (incompatible) "
+                    f"(formato actual es {VECTOR_DIM}) - pool descartada, REENTRENAR GESTOS"
                 )
                 needs_retrain.append(name)
                 gestures.append(
@@ -322,20 +280,18 @@ def _load_legacy_json():
 
         if needs_retrain:
             print(
-                f"[trainer] {len(needs_retrain)} gesture(s) need retraining: "
+                f"[trainer] {len(needs_retrain)} gesto(s) necesitan ser re-entrenados: "
                 + ", ".join(needs_retrain)
             )
 
         return gestures if gestures else None
 
     except Exception as e:
-        print(f"[trainer] legacy JSON load failed: {e}")
+        print(f"[trainer] fallo al cargar JSON de versión anterior: {e}")
         return None
 
 
-# ===============================================================================
-#  POOL CACHE
-# ===============================================================================
+# CACHE
 
 
 @dataclass
@@ -366,9 +322,7 @@ class _PoolCache:
         return cls(matrix=matrix, labels=labels, valid=True)
 
 
-# ===============================================================================
-#  GESTURE TRAINER
-# ===============================================================================
+# ENTRENADOR DE GESTOS
 
 
 class GestureTrainer:
@@ -399,14 +353,14 @@ class GestureTrainer:
             self._gestures = gestures
             self._cache = _PoolCache.build(gestures)
 
-        print(f"[trainer] loaded {len(gestures)} gesture(s) from {source}")
+        print(f"[trainer] cargados {len(gestures)} gesto(s) desde {source}")
 
         if source == "legacy JSON":
             try:
                 self._save()
-                print("[trainer] migrated to binary format")
+                print("[trainer] migrado a formato binario")
             except Exception as e:
-                print(f"[trainer] migration save failed: {e}")
+                print(f"[trainer] migración fallida: {e}")
 
     def _save(self):
         try:
@@ -414,7 +368,7 @@ class GestureTrainer:
                 gestures = list(self._gestures)
             _save_binary(gestures)
         except Exception as e:
-            print(f"[trainer] save failed: {e}")
+            print(f"[trainer] guardado fallido: {e}")
 
     def _rebuild_cache(self):
         self._cache = _PoolCache.build(self._gestures)
@@ -422,7 +376,7 @@ class GestureTrainer:
     def start_recording(self, name: str):
         name = name.strip().upper()
         if not name:
-            raise ValueError("Gesture name cannot be empty")
+            raise ValueError("Nombre de gesto no puede ser vacío")
         with self._lock:
             self._recording_name = name
             self._banked_frames = []
@@ -473,12 +427,12 @@ class GestureTrainer:
             self._clip_frames = []
 
         if not name:
-            raise RuntimeError("No recording session in progress")
+            raise RuntimeError("Sin sesión de grabado en progreso")
         if not frames:
-            raise RuntimeError("No frames captured")
+            raise RuntimeError("Ningún fotograma capturado")
         if clip_count < MIN_CLIPS:
             raise RuntimeError(
-                f"Only {clip_count} clip(s) recorded; need at least {MIN_CLIPS}"
+                f"Solo {clip_count} clip(s) grabados; se necesitan por lo menos {MIN_CLIPS}"
             )
 
         pool = np.stack(frames, axis=0).astype(np.float32)
@@ -497,8 +451,8 @@ class GestureTrainer:
 
         self._save()
         print(
-            f"[trainer] saved '{name}' - {clip_count} clips, "
-            f"{len(frames)} frames -> command '{command}'"
+            f"[trainer] guardado '{name}' - {clip_count} clips, "
+            f"{len(frames)} fotogramas -> comando '{command}'"
         )
         return name
 

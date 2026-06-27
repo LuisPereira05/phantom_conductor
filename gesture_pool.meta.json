@@ -26,5 +26,12 @@
     "clips": 3,
     "frames": 750,
     "needs_retrain": false
+  },
+  {
+    "name": "OK",
+    "command": "loop_toggle",
+    "clips": 3,
+    "frames": 558,
+    "needs_retrain": false
   }
 ]

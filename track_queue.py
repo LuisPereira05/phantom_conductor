@@ -1,28 +1,22 @@
-"""
-Phantom Conductor — Track Queue
-================================
-Extracted from state.py so that both state.py and tracklist.py can
-import it without creating a circular dependency.
-
-Import pattern:
-    from track_queue import TrackQueue
-"""
-
 import os
 import threading
 
 
 class TrackQueue:
-    """Thread-safe FIFO queue for audio tracks with BPM metadata."""
+    """Fila FIFO para tracks de audio con metadatos de BPM"""
 
     def __init__(self):
-        self._lock   = threading.Lock()
-        self._tracks = []   # list of dicts: {path, name, bpm, duration}
-        self._index  = 0
+        self._lock = threading.Lock()
+        self._tracks = []  # list de dicts: {path, name, bpm, duration}
+        self._index = 0
 
     def add(self, path: str, bpm: float | None = None, duration: float = 0.0):
-        entry = {"path": path, "name": os.path.basename(path),
-                 "bpm": bpm, "duration": duration}
+        entry = {
+            "path": path,
+            "name": os.path.basename(path),
+            "bpm": bpm,
+            "duration": duration,
+        }
         with self._lock:
             self._tracks.append(entry)
 
@@ -38,18 +32,26 @@ class TrackQueue:
     def move_up(self, idx: int):
         with self._lock:
             if 0 < idx < len(self._tracks):
-                self._tracks[idx-1], self._tracks[idx] = \
-                    self._tracks[idx], self._tracks[idx-1]
-                if   self._index == idx:     self._index = idx - 1
-                elif self._index == idx - 1: self._index = idx
+                self._tracks[idx - 1], self._tracks[idx] = (
+                    self._tracks[idx],
+                    self._tracks[idx - 1],
+                )
+                if self._index == idx:
+                    self._index = idx - 1
+                elif self._index == idx - 1:
+                    self._index = idx
 
     def move_down(self, idx: int):
         with self._lock:
             if 0 <= idx < len(self._tracks) - 1:
-                self._tracks[idx], self._tracks[idx+1] = \
-                    self._tracks[idx+1], self._tracks[idx]
-                if   self._index == idx:     self._index = idx + 1
-                elif self._index == idx + 1: self._index = idx
+                self._tracks[idx], self._tracks[idx + 1] = (
+                    self._tracks[idx + 1],
+                    self._tracks[idx],
+                )
+                if self._index == idx:
+                    self._index = idx + 1
+                elif self._index == idx + 1:
+                    self._index = idx
 
     def set_bpm(self, idx: int, bpm: float):
         with self._lock:
@@ -64,13 +66,15 @@ class TrackQueue:
 
     def next_track(self) -> dict | None:
         with self._lock:
-            if not self._tracks: return None
+            if not self._tracks:
+                return None
             self._index = (self._index + 1) % len(self._tracks)
             return dict(self._tracks[self._index])
 
     def prev_track(self) -> dict | None:
         with self._lock:
-            if not self._tracks: return None
+            if not self._tracks:
+                return None
             self._index = (self._index - 1) % len(self._tracks)
             return dict(self._tracks[self._index])
 

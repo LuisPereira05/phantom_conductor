@@ -1,10 +1,3 @@
-"""
-Phantom Conductor — Logger
-==========================
-Thread-safe ring-buffer logger with severity levels.
-All pipeline components import this; the UI drains it each frame.
-"""
-
 import collections
 import threading
 import time
