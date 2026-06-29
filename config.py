@@ -26,7 +26,6 @@ _DEFAULTS: dict = {
     "pedal_key": "space",  # tecla de simulación del pedal
     # TEMPO TAPPER
     "use_tempo_tapper": False,
-    "tap_key": "t",  # tecla "override" del tempo del pedal
     # ANÁLISIS DE BPM
     "smooth_alpha": 0.3,  # razón de suavizado
     "min_bpm": 60,

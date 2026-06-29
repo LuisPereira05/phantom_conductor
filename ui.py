@@ -6,6 +6,8 @@ import time
 import dearpygui.dearpygui as dpg
 import numpy as np
 
+from pedal_setup_ui import PedalSetupUI
+
 try:
     import sounddevice as sd
 
@@ -117,12 +119,12 @@ def _read_audio_meta(path: str) -> tuple[float | None, float]:
 #  PHANTOM UI
 
 
-class PhantomUI(GestureTrainUI):
+class PhantomUI(GestureTrainUI, PedalSetupUI):
     WIN_W, WIN_H = 1420, 900
 
     _CAM_UPLOAD_EVERY = 2
 
-    def __init__(self, state: PhantomState, logger: Logger):
+    def __init__(self, state, logger, pedal=None):
         self.state = state
         self.logger = logger
         self._tick = 0
@@ -139,6 +141,9 @@ class PhantomUI(GestureTrainUI):
         self._last_gesture: str = ""
         self._last_gesture_col: tuple = C["text_dim"]
         self._last_bpm_source: str = ""
+
+        self.pedal = pedal
+        self._pedal_last_sig = ()
 
     # ── helpers de tema ───────────────────────────────────────────────────────
     def _btn(self, fg, bg, bd):
@@ -187,6 +192,7 @@ class PhantomUI(GestureTrainUI):
         self._build_ui()
         self._setup_file_dialog()
         self._build_train_popup()
+        self._build_pedal_popup()
         dpg.setup_dearpygui()
         dpg.show_viewport()
 
@@ -200,6 +206,7 @@ class PhantomUI(GestureTrainUI):
             self._update_transport(snap)
             self._update_gesture(snap)
             self._update_train_ui()
+            self._update_pedal_ui()
             self._update_queue_panel()
             self._update_io_status(snap)
             self._sync_gain()
@@ -407,6 +414,12 @@ class PhantomUI(GestureTrainUI):
                     tag="btn_train_open",
                     callback=self._cb_train_open,
                     width=160,
+                )
+                dpg.add_button(
+                    label=" PEDAL SETUP ",
+                    tag="btn_pedal_open",
+                    callback=self._cb_pedal_open,
+                    width=140,
                 )
                 dpg.bind_item_theme("btn_train_open", self._th_blue)
 

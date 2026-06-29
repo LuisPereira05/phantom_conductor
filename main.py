@@ -6,6 +6,7 @@ from audio_processing import backing_track_thread
 from config import CFG
 from gesture_recognition import gesture_vision_thread
 from logger import Logger
+from pedal import make_pedal_dispatch
 from state import PhantomState
 from tempo_tapper import tempo_tapper_thread
 from ui import PhantomUI
@@ -59,6 +60,15 @@ def main():
         name="gesture-vision",
     ).start()
 
+    pedal = make_pedal_dispatch(state, logger)
+
+    threading.Thread(
+        target=tempo_tapper_thread,
+        args=(state, logger, pedal),
+        daemon=True,
+        name="tempo-tapper",
+    ).start()
+
     threading.Thread(
         target=tempo_tapper_thread,
         args=(state, logger),
@@ -67,7 +77,7 @@ def main():
     ).start()
 
     # Interfaz
-    ui = PhantomUI(state, logger)
+    ui = PhantomUI(state, logger, pedal=pedal)
     try:
         ui.run()
     except KeyboardInterrupt:

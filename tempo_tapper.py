@@ -2,6 +2,7 @@ import re
 import time
 
 import serial
+from pedal import PedalController
 from serial.tools import list_ports
 
 from config import CFG
@@ -11,8 +12,15 @@ from state import PhantomState
 BAUD_DEFAULT = 115200
 RECONNECT_DELAY = 2.0
 READ_TIMEOUT = 0.5
+
 _BPM_RE = re.compile(r"^BPM:([0-9.]+)\s*$")
 _OOR_RE = re.compile(r"^TAP:out_of_range\s+([0-9.]+)\s*$")
+
+# Pedal button lines, e.g. "B1p" (button 1 pressed) / "B2r" (button 2
+# released). Shares this same serial connection/thread with the tempo
+# tapper — see pedal.py for the tap/hold/combo state machine these
+# events feed into.
+_PEDAL_RE = re.compile(r"^B([1-9])(p|r)\s*$")
 
 
 # PUERTOS
@@ -29,14 +37,12 @@ def _autodetect_port(logger: Logger) -> str | None:
     candidates = list(list_ports.comports())
     if not candidates:
         return None
-
     keywords = ("arduino", "ch340", "usb-serial", "usb serial", "wchusbserial")
     for p in candidates:
         desc = (p.description or "").lower()
         if any(k in desc for k in keywords):
             logger.info(f"tap: autodetected port {p.device} ({p.description})")
             return p.device
-
     logger.warn(
         f"tap: ningun puerto obviamente Arduino — usando {candidates[0].device}"
     )
@@ -46,7 +52,13 @@ def _autodetect_port(logger: Logger) -> str | None:
 # Parseo de lineas
 
 
-def _handle_line(line: str, state: PhantomState, logger: Logger, tapper_active: bool):
+def _handle_line(
+    line: str,
+    state: PhantomState,
+    logger: Logger,
+    tapper_active: bool,
+    pedal: PedalController | None = None,
+):
     line = line.strip()
     if not line:
         return
@@ -84,17 +96,39 @@ def _handle_line(line: str, state: PhantomState, logger: Logger, tapper_active: 
         logger.info(f"tap: tap out of range ({m.group(1)} bpm) — ignorado")
         return
 
+    m = _PEDAL_RE.match(line)
+    if m:
+        if pedal is None:
+            # Pedal controller not wired in for this run — line is
+            # recognized but there's nowhere to send it.
+            return
+        button_id = int(m.group(1))
+        is_press = m.group(2) == "p"
+        pedal.handle_event(button_id, is_press)
+        return
+
     logger.warn(f"tap: linea no reconocida: {line!r}")
 
 
 # SERIAL THREAD
 
 
-def tempo_tapper_thread(state: PhantomState, logger: Logger):
+def tempo_tapper_thread(
+    state: PhantomState, logger: Logger, pedal: PedalController | None = None
+):
+    """
+    Same serial connection serves both the tempo tapper (BPM:/TAP:
+    lines) and the foot pedal (B<n>p / B<n>r lines) — one Arduino, one
+    port, two logical devices sharing the wire protocol. Pass a
+    PedalController (see pedal.py / pedal.make_pedal_dispatch) to wire
+    pedal lines somewhere; pass None to run tempo-tapper-only, e.g. on
+    setups with no pedal attached, exactly as before this feature
+    was added.
+    """
     baud = CFG.get("tap_baud", BAUD_DEFAULT)
     logged_disabled_once = False
-
     ser = None
+
     while state.alive():
         if ser is None:
             port = CFG.get("tap_port") or _autodetect_port(logger)
@@ -121,8 +155,7 @@ def tempo_tapper_thread(state: PhantomState, logger: Logger):
                 continue
             line = raw.decode("utf-8", errors="replace")
             tapper_active = CFG.get("use_tempo_tapper", False)
-            _handle_line(line, state, logger, tapper_active)
-
+            _handle_line(line, state, logger, tapper_active, pedal=pedal)
         except (serial.SerialException, OSError) as e:
             logger.err(f"tap: serial error, reconectando: {e}")
             try:

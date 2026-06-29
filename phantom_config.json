@@ -16,11 +16,26 @@
   "use_pedal": false,
   "pedal_key": "space",
   "use_tempo_tapper": false,
-  "tap_key": "t",
   "smooth_alpha": 0.3,
   "min_bpm": 60,
   "max_bpm": 200,
   "analyze_every": 0.25,
   "bpm_median_window": 2,
-  "rms_threshold": 0.03
+  "rms_threshold": 0.03,
+  "pedal_map": {
+    "B1_TAP": "toggle",
+    "B2_TAP": "loop_toggle",
+    "B3_TAP": "loop_next",
+    "B1_HOLD": "prev",
+    "B2_HOLD": "pause",
+    "B3_HOLD": "next",
+    "B1+B2_TAP": "none",
+    "B1+B2_HOLD": "none",
+    "B1+B3_TAP": "none",
+    "B1+B3_HOLD": "none",
+    "B2+B3_TAP": "none",
+    "B2+B3_HOLD": "none",
+    "B1+B2+B3_TAP": "none",
+    "B1+B2+B3_HOLD": "none"
+  }
 }
