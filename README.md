@@ -1,56 +1,58 @@
 # Phantom Conductor
 
-A real-time conducting interface for backing tracks: control playback with
-hand gestures or a footswitch, and have the track's tempo follow either a
-live BPM detector listening to a microphone, or manual foot-taps from an
-Arduino piezo pedal.
+Interfaz de dirección en tiempo real para pistas de acompañamiento: controla la reproducción
+con gestos de mano o un pedal de pie, y haz que el tempo de la pista siga al detector de BPM
+en vivo (micrófono), a golpes manuales con un Arduino, o a un pedal de 3 botones.
 
-Everything runs as a set of daemon threads sharing one thread-safe state
-object, with a Dear PyGui dashboard on the main thread.
+Todo corre como un conjunto de hilos daemon que comparten un único objeto de estado
+thread-safe, con un dashboard Dear PyGui en el hilo principal.
 
 ```
-pip install dearpygui mutagen sounddevice
+pip install dearpygui mutagen sounddevice pyserial
 ```
 
 ---
 
-## Project layout
+## Estructura del proyecto
 
 ```
 phantom_conductor/
-├─ main.py                  — entry point; starts all threads, then dpg.run()
+├─ main.py                  — punto de entrada; inicia todos los hilos, luego dpg.run()
 │
-├─ state.py                 — shared thread-safe state + track queue
-├─ config.py                — settings, persisted to phantom_config.json
-├─ buffers.py                — shared ring buffer / queue singletons
-├─ logger.py                — thread-safe ring-buffer logger
+├─ state.py                 — estado compartido thread-safe + cola de pistas
+├─ config.py                — configuración, persistida en phantom_config.json
+├─ buffers.py               — singletons de ring buffer / queue compartidos
+├─ logger.py                — logger thread-safe con ring buffer
 │
-├─ audio_input.py           — mic/speaker I/O (sounddevice)
-├─ audio_analysis.py        — BPM detection DSP chain
-├─ audio_processing.py      — track loading + beat-synced playback
-├─ tempo_tapper.py          — Arduino foot-tapper serial bridge
+├─ audio_input.py           — E/S de micrófono/altavoz (sounddevice)
+├─ audio_analysis.py        — cadena DSP de detección de BPM
+├─ audio_processing.py      — carga de pistas + reproducción sincronizada con beats
+├─ tempo_tapper.py          — puente serial Arduino: tempo tapper Y pedal de botones
 │
-├─ video_input.py           — OpenCV camera + MediaPipe HandLandmarker
-├─ gesture_recognition.py   — gesture classification + HUD overlay
-├─ gesture_trainer.py       — custom gesture feature extraction/matching
-├─ gesture_train_ui.py      — Dear PyGui training workflow mixin
+├─ pedal.py                 — máquina de estados: detección tap/hold/combo de 3 botones
+├─ pedal_setup_ui.py        — mixin Dear PyGui para la ventana PEDAL SETUP
 │
-├─ track_queue.py           — in-memory TrackQueue
-├─ tracklist.py             — TrackQueue + JSON persistence
-├─ ui.py                    — Dear PyGui dashboard (main thread)
+├─ video_input.py           — cámara OpenCV + MediaPipe HandLandmarker
+├─ gesture_recognition.py   — clasificación de gestos + overlay HUD
+├─ gesture_trainer.py       — extracción de features + matching de gestos personalizados
+├─ gesture_train_ui.py      — mixin Dear PyGui para el flujo de entrenamiento de gestos
 │
-├─ audio/                   — track library
-├─ hand_landmarker.task     — MediaPipe model (auto-downloaded if missing)
+├─ track_queue.py           — TrackQueue en memoria
+├─ tracklist.py             — TrackQueue + persistencia JSON
+├─ ui.py                    — dashboard Dear PyGui (hilo principal)
+│
+├─ audio/                   — biblioteca de pistas
+├─ hand_landmarker.task     — modelo MediaPipe (descargado automáticamente si falta)
 ├─ requirements.txt
 │
-├─ phantom_config.json      — CFG persistence (config.py)
-├─ tracklist.json           — track queue persistence (tracklist.py)
-├─ gesture_pool.bin         — trained gesture vectors (gesture_trainer.py)
-├─ gesture_pool.meta.json   — gesture names/commands sidecar
-└─ gesture_templates.json   — legacy gesture format, migrated on first load
+├─ phantom_config.json      — persistencia de CFG (config.py)
+├─ tracklist.json           — persistencia de la cola (tracklist.py)
+├─ gesture_pool.bin         — vectores de gestos entrenados (gesture_trainer.py)
+├─ gesture_pool.meta.json   — nombres/comandos de gestos (sidecar)
+└─ gesture_templates.json   — formato legacy de gestos, migrado en el primer arranque
 ```
 
-## Thread map
+## Mapa de hilos
 
 ```
 main.py
@@ -60,299 +62,303 @@ main.py
  │                     ├─ audio-in   → audio_input.input_thread
  │                     └─ audio-out  → audio_input.playback_thread
  ├─ gesture-vision  → gesture_recognition.gesture_vision_thread
- │                     (internally uses video_input helpers)
+ │                     (usa internamente los helpers de video_input)
  └─ tempo-tapper    → tempo_tapper.tempo_tapper_thread
-                       (reads BPM taps from the Arduino piezo over serial)
+                       (lee golpes de BPM del piezo Arduino Y eventos de botones del pedal)
 
-Main thread → ui.PhantomUI.run()   (Dear PyGui must run on the main thread)
+Hilo principal → ui.PhantomUI.run()   (Dear PyGui debe correr en el hilo principal)
 ```
 
-Camera index is read from `phantom_config.json` by default; a command-line
-override still works:
+El índice de cámara se lee de `phantom_config.json` por defecto; también se puede pasar
+por línea de comandos:
 
 ```
 python main.py 2
 ```
 
-The tempo-tapper thread always starts, even with no tapper configured —
-it checks `CFG.use_tempo_tapper` live on every serial line, so the Settings
-checkbox can enable or disable it at runtime with no restart. If no Arduino
-is plugged in, it just logs a periodic "no serial port found — retrying…"
-warning and is otherwise harmless to leave running.
+El hilo tempo-tapper siempre arranca, incluso sin tapper configurado — verifica
+`CFG.use_tempo_tapper` en cada línea serial, por lo que el checkbox de Configuración
+puede habilitarlo o deshabilitarlo en tiempo de ejecución sin reiniciar. Si no hay
+Arduino conectado, solo loguea un aviso periódico "no se encontró puerto serial —
+reintentando…" y es inofensivo dejarlo corriendo.
 
 ---
 
-## Module map
+## Mapa de módulos
 
-| Module | Responsibility |
+| Módulo | Responsabilidad |
 |---|---|
-| `state.py` | Thread-safe shared state and track queue. No I/O, no threads, no GUI. |
-| `config.py` | Single source of truth for user-adjustable settings, persisted to `config.json`. |
-| `buffers.py` | Shared ring buffer / queue singletons so audio modules avoid circular imports. |
-| `audio_input.py` | Pure I/O: mic callback, input/output streams, device-restart watcher. |
-| `audio_analysis.py` | BPM detection DSP chain from raw mic samples. |
-| `audio_processing.py` | Track loading and beat-synchronous backing-track playback with live time-stretching. |
-| `tempo_tapper.py` | Serial bridge to the Arduino foot-tapper. |
-| `gesture_recognition.py` | Hand-gesture classification (custom + built-in) and HUD overlay. |
-| `gesture_trainer.py` | Rotation-invariant feature extraction and custom gesture storage/matching. |
-| `gesture_train_ui.py` | Dear PyGui mixin for the gesture training workflow. |
-| `video_input.py` | Owns the OpenCV camera and MediaPipe HandLandmarker session. |
-| `track_queue.py` | In-memory track queue (extracted to avoid a circular import). |
-| `tracklist.py` | `TrackQueue` + automatic JSON persistence (`tracklist.json`). |
-| `ui.py` | The full Dear PyGui dashboard. |
-| `logger.py` | Thread-safe ring-buffer logger with severity levels. |
+| `state.py` | Estado compartido thread-safe y cola de pistas. Sin E/S, sin hilos, sin GUI. |
+| `config.py` | Fuente única de verdad para ajustes del usuario, persistida en `config.json`. |
+| `buffers.py` | Singletons de ring buffer / queue compartidos para evitar imports circulares entre módulos de audio. |
+| `audio_input.py` | E/S pura: callback del micrófono, streams de entrada/salida, watcher de reinicio de dispositivo. |
+| `audio_analysis.py` | Cadena DSP de detección de BPM a partir de muestras crudas del micrófono. |
+| `audio_processing.py` | Carga de pistas y reproducción de backing track beat-a-beat con time-stretching en vivo. |
+| `tempo_tapper.py` | Puente serial al Arduino. Maneja tanto las líneas `BPM:`/`TAP:` del tempo tapper como las líneas `B<n>p`/`B<n>r` del pedal de botones — **una sola conexión serial, dos dispositivos lógicos**. |
+| `pedal.py` | Máquina de estados pura para el pedal de 3 botones: detección de tap, hold y combos por superposición temporal. Sin imports de serial — solo lógica. |
+| `pedal_setup_ui.py` | Mixin Dear PyGui para la ventana PEDAL SETUP: indicadores de botones en vivo y tabla de remapeo de comandos. |
+| `gesture_recognition.py` | Clasificación de gestos de mano (personalizados + integrados) y overlay HUD. |
+| `gesture_trainer.py` | Extracción de features invariante a rotación y almacenamiento/matching de gestos personalizados. |
+| `gesture_train_ui.py` | Mixin Dear PyGui para el flujo de entrenamiento de gestos. |
+| `video_input.py` | Posee la cámara OpenCV y la sesión MediaPipe HandLandmarker. |
+| `track_queue.py` | Cola de pistas en memoria (extraída para evitar import circular). |
+| `tracklist.py` | `TrackQueue` + persistencia automática en JSON (`tracklist.json`). |
+| `ui.py` | Dashboard Dear PyGui completo. |
+| `logger.py` | Logger thread-safe con ring buffer y niveles de severidad. |
 
 ---
 
-## Shared state — `state.py`
+## Estado compartido — `state.py`
 
-Pure data containers shared by every pipeline component. Key pieces:
+Contenedores de datos puros compartidos por todos los componentes del pipeline. Piezas clave:
 
-- **Loop sections** — `loop_section_index`, `loop_sections` (derived from
-  sorted markers), plus `get_loop_section()` / `step_loop_section()`.
-- **`dispatch_command()`** — the single place that maps command strings
+- **Secciones de loop** — `loop_section_index`, `loop_sections` (derivadas de marcadores
+  ordenados), más `get_loop_section()` / `step_loop_section()`.
+- **`dispatch_command()`** — el único lugar que mapea strings de comando
   (`play`, `pause`, `next`, `prev`, `loop_toggle`, `loop_next`, `loop_prev`)
-  to state mutations. `gesture_recognition` calls this instead of calling
-  `play()` / `pause()` directly.
-- **`skip_to_next` / `skip_to_prev` flags** — honoured by
-  `backing_track_thread`, so gesture- or tap-triggered skips actually move
-  the track, not just flip a flag nothing reads.
-- **Tap-override window** — `apply_tap_bpm()` / `apply_audio_bpm()` let
-  manual foot-taps "win" over the smoothed audio BPM for a short period,
-  instead of both writers fighting over `set_bpm()`. `set_bpm()` itself is
-  untouched. `tap_connected` exposes serial status to the Settings/HUD panel.
-- **`last_bpm_analysis_dbg`** — kept fresh by the audio thread every pass
-  regardless of whether tapper mode gates the actual BPM write, so HUD/debug
-  views don't go stale while tapper mode is active. The live
-  `CFG.use_tempo_tapper` check itself lives in `audio_analysis.py` and
-  `tempo_tapper.py`, checked every loop pass in both — the override window
-  here is a secondary safety net, not the only thing keeping the two BPM
-  sources from fighting.
+  a mutaciones de estado. `gesture_recognition`, `tempo_tapper` y el pedal
+  llaman esto en lugar de llamar `play()` / `pause()` directamente.
+- **Flags `skip_to_next` / `skip_to_prev`** — respetadas por `backing_track_thread`,
+  para que los skips por gesto, tap o pedal realmente cambien la pista.
+- **Ventana de override de tap** — `apply_tap_bpm()` / `apply_audio_bpm()` dejan que
+  los golpes manuales del piezo "ganen" sobre el BPM de audio durante un período corto.
+- **`last_bpm_analysis_dbg`** — actualizado por el hilo de audio en cada pasada,
+  incluso cuando el modo tapper bloquea la escritura del BPM, para que el HUD no
+  se quede estancado.
 
 ---
 
-## Audio I/O — `audio_input.py`
+## E/S de audio — `audio_input.py`
 
-Owns **no** analysis and **no** track loading — pure I/O:
+No posee análisis ni carga de pistas — E/S pura:
 
-- `audio_callback` — called by `sounddevice` on its own OS thread; pushes
-  mono samples into the shared ring buffer and updates the RMS waveform on
-  `PhantomState`.
-- `input_thread` — opens the `sounddevice.InputStream`; exits when
-  `STATE.io_restart_requested` is set.
-- `playback_thread` — opens the `sounddevice.OutputStream`; drains
-  `audio_queue`.
-- `io_manager_thread` — watches for I/O restart requests from the UI and
-  cycles both stream threads onto new devices.
+- `audio_callback` — llamado por `sounddevice` en su propio hilo de OS; empuja muestras
+  mono al ring buffer compartido y actualiza el RMS en `PhantomState`.
+- `input_thread` — abre el `sounddevice.InputStream`; sale cuando se setea
+  `STATE.io_restart_requested`.
+- `playback_thread` — abre el `sounddevice.OutputStream`; vacía `audio_queue`.
+- `io_manager_thread` — observa pedidos de reinicio de E/S desde la UI y cicla
+  ambos hilos de stream a nuevos dispositivos.
 
 ---
 
-## BPM detection — `audio_analysis.py`
+## Detección de BPM — `audio_analysis.py`
 
-Reads raw microphone samples from the shared ring buffer and writes a
-smoothed, octave-corrected BPM estimate back to `PhantomState`.
+Lee muestras crudas del micrófono desde el ring buffer compartido y escribe una
+estimación de BPM suavizada y corregida por octava de vuelta en `PhantomState`.
 
-**DSP chain:**
+**Cadena DSP:**
 
 ```
-raw samples
-  → bandpass filter (40–3000 Hz)
-  → HPSS (percussive component)
-  → onset strength (median aggregate)
-  → full autocorrelation
-  → parabolic peak interpolation
-  → octave correction  (½× / 1× / 2× closest to previous)
-  → exponential smoothing (α = CFG.smooth_alpha)
+muestras crudas
+  → filtro bandpass (40–8000 Hz)
+  → HPSS (componente percusiva)
+  → onset strength (agregado mediana)
+  → autocorrelación completa
+  → interpolación parabólica de pico
+  → corrección de octava  (½× / 1× / 2× más cercano al anterior)
+  → suavizado mediana (ventana de CFG.bpm_median_window beats)
   → STATE.apply_audio_bpm()
 ```
 
-`MIN_BPM`, `MAX_BPM`, `SMOOTH_ALPHA`, and `ANALYZE_EVERY` are read from
-`CFG` so the Settings panel can override them at runtime.
+`MIN_BPM`, `MAX_BPM` y `ANALYZE_EVERY` se leen de `CFG`, por lo que el panel de
+Configuración puede sobrescribirlos en tiempo de ejecución.
 
-**Tempo-tapper coexistence:** `bpm_analysis_thread` checks
-`CFG.use_tempo_tapper` on every pass, not just at startup, and skips writing
-audio-derived BPM entirely while tapper mode is enabled. Previously the only
-thing preventing audio from overwriting a tap was the 4 s override window in
-`state.apply_audio_bpm()`, so the mic would silently take back over a few
-seconds after every tap. Checking the live config flag means flipping the
-Settings checkbox takes effect immediately in both directions, with no
-thread restart needed. The thread still calls `estimate_bpm()` even while
-gated off, so `bpm_analysis_dbg` stays fresh for diagnostics — it just
-doesn't push the result into state when tapper mode owns the BPM.
+**Coexistencia con el tapper:** `bpm_analysis_thread` verifica `CFG.use_tempo_tapper`
+en cada pasada y omite completamente la escritura del BPM derivado del audio mientras
+el modo tapper está habilitado.
 
 ---
 
-## Track loading & playback — `audio_processing.py`
+## Carga y reproducción de pistas — `audio_processing.py`
 
-- `load_track` — loads any audio file via `librosa`; reads BPM from a
-  metadata tag or falls back to `beat_track` estimation.
-- `backing_track_thread` — beat-by-beat playback loop with live
-  time-stretching (`pyrubberband`). Reads live BPM from `PhantomState`,
-  stretches each beat block to match, and pushes it to the shared
-  `audio_queue` for `audio_input`'s playback thread to drain.
+- `load_track` — carga cualquier archivo de audio via `librosa`; lee BPM desde un tag
+  de metadatos o recurre a estimación con `beat_track`.
+- `backing_track_thread` — loop de reproducción beat a beat con time-stretching en vivo
+  (`pyrubberband`). Lee BPM en vivo desde `PhantomState`, estira cada bloque para
+  que coincida, y lo empuja al `audio_queue` compartido para que el hilo de reproducción
+  de `audio_input` lo vacíe.
 
-Reads from `PhantomState` (BPM, gain, flags) and writes only track-progress
-fields (position, duration, `bpm_original`). Never touches `sounddevice`
-directly — that's `audio_input`'s job.
-
-**Skip handling:** `backing_track_thread` now actually consumes
-`state.skip_to_next` / `state.skip_to_prev`. Previously
-`state.dispatch_command("next"/"prev")` only set these flags — nothing
-downstream read them, so gesture- or tap-triggered next/prev silently did
-nothing even though the dispatch itself worked correctly (visible in the
-log as `gesture [...] POINT -> next` with no actual track change). The flag
-is read-and-cleared under the lock in one step — the same pattern already
-used for `load_new_track` — so a gesture firing twice in quick succession
-can't queue up two skips. Routed through `state.queue.next_track()` /
-`prev_track()`, the same calls the UI's Prev/Next buttons already use, so
-behavior stays consistent regardless of whether the skip came from a
-button, a gesture, or a second tapper input in the future.
+**Phase-lock loop (PLL):** En cada beat, nuevos marcadores de tiempo son registrados
+en una instancia de `PhaseLock`. Compara cada marcador detectado con una grilla extrapolada
+y produce un multiplicador de corrección de velocidad para mantener la pista sincronizada
+con el músico. Se resetea cada vez que se carga una nueva pista.
 
 ---
 
-## Foot tempo tapper — `tempo_tapper.py`
+## Tempo tapper por piezo — `tempo_tapper.py`
 
-Reads line-based BPM events from the Arduino piezo tapper over USB serial
-and writes them into `PhantomState` via `state.apply_tap_bpm()` — the same
-pairing `audio_analysis.py` uses via `apply_audio_bpm()`.
+Lee eventos de línea del Arduino sobre USB serial y enruta dos protocolos independientes
+que comparten la misma conexión:
 
-**Wire protocol** (from `tempo_tapper.ino`):
+**Protocolo del tempo tapper** (`BPM:`/`TAP:` lines):
 
-| Message | Meaning |
+| Mensaje | Significado |
 |---|---|
-| `READY` | Sent once on boot |
-| `TAP:first` | First tap of a new pair, no BPM yet |
-| `BPM:<float>` | Second tap landed in range, e.g. `BPM:128.4` |
-| `TAP:out_of_range <bpm>` | Second tap outside 40–300 BPM, informational |
-| `TAP:timeout` | `waiting_second` cleared after `TIMEOUT_MS` |
+| `READY` | Enviado una vez al arrancar |
+| `TAP:first` | Primer tap del par, sin BPM aún |
+| `BPM:<float>` | Segundo tap en rango, ej. `BPM:128.4` |
+| `TAP:out_of_range <bpm>` | Segundo tap fuera de 40–300 BPM, informativo |
+| `TAP:timeout` | `waiting_second` limpiado tras `TIMEOUT_MS` |
 
-**Why a "source" flag:** `bpm_analysis_thread` (audio) and this thread both
-want to own `state.bpm_live`. Coordination happens in two layers:
+**Protocolo del pedal** (`B<n>p`/`B<n>r` lines):
 
-1. `CFG.use_tempo_tapper` is checked **live** by both threads, every pass.
-   - `audio_analysis_thread` skips `apply_audio_bpm()` entirely while this
-     is `True`.
-   - This thread still keeps the serial port open and drains incoming
-     lines while it's `False` (so the OS read buffer doesn't back up and
-     nothing is lost when it's flipped back on), but doesn't call
-     `state.apply_tap_bpm()` until it's `True` again.
-2. `state.apply_tap_bpm()` / `apply_audio_bpm()` still maintain the short
-   override window as a second line of defence — useful if someone flips
-   the checkbox mid-tap, or a stray audio analysis pass lands in the same
-   instant a tap comes in.
+| Mensaje | Significado |
+|---|---|
+| `B1p` | Botón 1 presionado |
+| `B1r` | Botón 1 soltado |
+| `B2p` / `B2r` | Botón 2 presionado / soltado |
+| `B3p` / `B3r` | Botón 3 presionado / soltado |
 
-Both checks matter: (1) makes the checkbox mean something continuously, not
-just at thread startup; (2) avoids a race in the brief moment around the
-toggle. This module never decides PLAY/PAUSE — it only ever writes BPM. A
-second piezo/button for transport should route through
-`state.dispatch_command()`, the same way `gesture_recognition` does.
+Las líneas de botones se reenvían a un `PedalController` (ver `pedal.py`). Pasar
+`pedal=None` al thread hace que las líneas del pedal se reconozcan pero se ignoren,
+exactamente como antes de que se agregara esta feature — sin cambios necesarios en
+instalaciones sin pedal.
 
 ---
 
-## Gesture recognition — `gesture_recognition.py`
+## Pedal de 3 botones — `pedal.py`
 
-**Classification pipeline (per frame):**
+Módulo de lógica pura — sin import de serial. Las líneas del protocolo Arduino son
+parseadas por `tempo_tapper.py` y reenviadas aquí via `PedalController.handle_event()`.
+Esto refleja la separación `audio_analysis.py` / `audio_input.py`: DSP/lógica en un
+módulo, E/S cruda en otro.
 
-1. `TRAINER.match(lm)` — nearest-neighbour against saved custom templates.
-   A match within threshold overrides the built-ins; its command comes from
-   `TRAINER.command_for(name)`.
-2. `classify_gesture(lm)` — rule-based fallback for the four built-in
-   shapes (open hand, fist, index point, peace/V).
-3. The resulting name is stabilised over 10 frames (`GestureStabilizer`)
-   then held for `CFG.gesture_hold_frames` before executing via
-   `state.dispatch_command()`.
+### Conceptos de eventos
 
-**Built-in gestures:**
+| Tipo | Definición |
+|---|---|
+| **TAP** | Duración press→release menor a `CFG.pedal_hold_threshold_s` (default 0.35s) |
+| **HOLD** | Duración press→release mayor o igual al umbral |
+| **COMBO** | Dos o más botones cuyas ventanas `[press_time, release_time]` se superponen en algún instante (transitivamente) |
 
-| Gesture | Shape | Default command |
-|---|---|---|
-| `PLAY` | open hand (5 fingers) | `play` |
-| `PAUSE` | fist (0 fingers) | `pause` |
-| `POINT` | index only (1 finger) | `next` |
-| `PEACE` | V / peace (2 fingers) | `loop_toggle` |
+Un combo solo se resuelve cuando **todos** sus miembros han soltado, y solo si todos
+concuerdan en tap vs. hold. Si discrepan (ej. B1 como tap y B2 como hold), el grupo
+se descarta silenciosamente (se loguea en `debug`). Esto es intencional: una pulsación
+simultánea imprecisa que mezcle tap y hold casi seguro no es un gesto deliberado.
 
-Also includes `_draw_hand` / `_draw_hud` (OpenCV drawing helpers for the
-camera window) and `gesture_vision_thread`, the main loop that reads frames
-via `video_input`, classifies gestures, writes to `PhantomState`, and
-displays the annotated camera window.
-
----
-
-## Custom gesture training — `gesture_trainer.py` + `gesture_train_ui.py`
-
-Rotation-invariant static gesture recognition, trained from short video
-clips rather than single snapshots.
-
-### Feature extraction (19 floats per frame)
-
-| Range | Feature | Count |
-|---|---|---|
-| `[0:5]` | Extension ratios (tip–MCP distance / palm scale) | 5 |
-| `[5:10]` | PIP curl angles (radians, 0 = straight) | 5 |
-| `[10:14]` | Spread angles (3 adjacent finger-base pairs + 1 outer pair) | 4 |
-| `[14]` | Thumb-opposition ratio | 1 |
-| `[15:19]` | Fingertip pairwise distances (normalised) | 4 |
-
-All values are dimensionless ratios or bounded angles computed in a local
-basis anchored to the hand itself (wrist → middle-MCP as the primary axis),
-making them invariant to camera rotation, hand translation, and scale.
-
-### Storage
-
-- **Binary pool** (`gesture_pool.bin`) — raw IEEE-754 float32, no text
-  parsing on load; roughly 50–60% smaller on disk than the legacy JSON
-  format, with load time dropping from ~10–20 ms to under 1 ms.
-- **Meta sidecar** (`gesture_pool.meta.json`) — human-readable names,
-  commands, and clip counts.
-- A cached, pre-normalized pool matrix (`_PoolCache`) is built once after
-  load or after `finish()` and never rebuilt inside `match()`; row norms are
-  pre-computed at cache-build time. `match()` itself is a single BLAS
-  matrix–vector multiply (`pool_normed @ query`), running at
-  memory-bandwidth speed.
-- Legacy `gesture_templates.json` files are read once for migration. Any
-  gesture whose stored vectors don't match the current feature-vector
-  length is flagged `needs_retrain` and kept (name/command preserved) with
-  an empty pool, rather than silently producing garbage similarity scores.
-
-### Training workflow
+### Nombres canónicos de eventos
 
 ```
-[START SESSION] → [● REC] (hold while moving hand) → [■ STOP CLIP]
-                   repeat from different angles      → [SAVE GESTURE]
+B1_TAP   B1_HOLD
+B2_TAP   B2_HOLD
+B3_TAP   B3_HOLD
+B1+B2_TAP    B1+B2_HOLD
+B1+B3_TAP    B1+B3_HOLD
+B2+B3_TAP    B2+B3_HOLD
+B1+B2+B3_TAP B1+B2+B3_HOLD
 ```
 
-A gesture needs at least `MIN_CLIPS` (3) clips, recorded from different
-angles, before it can be saved — this is what gives the matcher enough
-variety to recognize the pose under rotation. Matching is cosine-similarity
-k-NN (`K_NEIGHBORS = 7`) with majority vote among the nearest neighbours.
+Los números de botón dentro del nombre de un combo siempre están ordenados de forma
+ascendente, independientemente del orden de pulsación.
 
-The training UI's recording flag is `state.clip_recording_active`; the
-vision thread calls `TRAINER.capture_frame(lm)` every frame while it's set.
+### Parámetros configurables
+
+| Parámetro CFG | Default | Descripción |
+|---|---|---|
+| `pedal_hold_threshold_s` | `0.35` | Umbral tap vs. hold en segundos |
+| `pedal_stuck_timeout_s` | `5.0` | Timeout de seguridad: abandona un botón cuya señal de release nunca llega (ej. cable suelto) sin bloquear el pedal indefinidamente |
+
+### Mapeo de comandos por defecto
+
+| Evento | Comando |
+|---|---|
+| `B1_TAP` | `toggle` |
+| `B2_TAP` | `next` |
+| `B3_TAP` | `prev` |
+| `B1_HOLD` | `loop_toggle` |
+| `B2_HOLD` | `loop_next` |
+| `B3_HOLD` | `loop_prev` |
+| todos los combos | `none` (configurar desde la UI) |
+
+Todo el mapeo es remapeable en tiempo de ejecución desde la ventana **PEDAL SETUP**
+sin reiniciar. Cambiar el valor en la tabla escribe inmediatamente en `CFG.pedal_map`.
 
 ---
 
-## Video input — `video_input.py`
+## Reconocimiento de gestos — `gesture_recognition.py`
 
-Owns the OpenCV `VideoCapture` and the MediaPipe `HandLandmarker` session.
-Does **not** draw anything and does **not** classify gestures — all of that
-lives in `gesture_recognition.py`.
+**Pipeline de clasificación (por frame):**
+
+1. `TRAINER.match(lm)` — vecino más cercano contra plantillas personalizadas guardadas.
+   Un match dentro del umbral anula los integrados; su comando viene de `TRAINER.command_for(name)`.
+2. `classify_gesture(lm)` — fallback basado en reglas para las cuatro formas integradas
+   (mano abierta, puño, señalar con índice, paz/V).
+3. El nombre resultante se estabiliza sobre 10 frames (`GestureStabilizer`) y luego
+   se mantiene `CFG.gesture_hold_frames` frames antes de ejecutar via `state.dispatch_command()`.
+
+**Gestos integrados:**
+
+| Gesto | Forma | Comando por defecto |
+|---|---|---|
+| `PLAY` | mano abierta (5 dedos) | `play` |
+| `PAUSE` | puño (0 dedos) | `pause` |
+| `POINT` | solo índice (1 dedo) | `next` |
+| `PEACE` | V / paz (2 dedos) | `loop_toggle` |
+
+---
+
+## Entrenamiento de gestos personalizados — `gesture_trainer.py` + `gesture_train_ui.py`
+
+Reconocimiento de gestos estáticos invariante a rotación, entrenado desde clips de video
+cortos en lugar de snapshots individuales.
+
+### Extracción de features (19 floats por frame)
+
+| Rango | Feature | Cantidad |
+|---|---|---|
+| `[0:5]` | Ratios de extensión (distancia tip–MCP / escala de palma) | 5 |
+| `[5:10]` | Ángulos de curvatura PIP (radianes, 0 = recto) | 5 |
+| `[10:14]` | Ángulos de apertura (3 pares adyacentes + 1 par exterior) | 4 |
+| `[14]` | Ratio de oposición del pulgar | 1 |
+| `[15:19]` | Distancias entre puntas de dedos (normalizadas) | 4 |
+
+Todos los valores son ratios adimensionales o ángulos acotados calculados en una base
+local anclada a la mano misma (muñeca → MCP del dedo medio como eje principal),
+lo que los hace invariantes a la rotación de la cámara, traslación y escala de la mano.
+
+### Almacenamiento
+
+- **Pool binario** (`gesture_pool.bin`) — float32 IEEE-754 crudo; ~50–60% más pequeño
+  que el formato JSON legacy, con tiempo de carga cayendo de ~10–20 ms a menos de 1 ms.
+- **Sidecar de metadatos** (`gesture_pool.meta.json`) — nombres, comandos y conteos de clips legibles.
+- Una matriz de pool pre-normalizada en caché (`_PoolCache`) se construye una vez tras
+  la carga o tras `finish()` y nunca se reconstruye dentro de `match()`; `match()` en sí
+  es un único producto matricial BLAS (`pool_normed @ query`).
+
+### Flujo de entrenamiento
+
+```
+[COMENZAR SESIÓN] → [● GRABAR] (mantener mientras se mueve la mano) → [■ PARAR CLIP]
+                     repetir desde distintos ángulos               → [GUARDAR GESTO]
+```
+
+Un gesto necesita al menos `MIN_CLIPS` (3) clips antes de poder guardarse. El matching
+usa k-NN de similitud coseno (`K_NEIGHBORS = 7`) con voto mayoritario entre los vecinos
+más cercanos.
+
+---
+
+## Entrada de video — `video_input.py`
+
+Posee el `VideoCapture` de OpenCV y la sesión `HandLandmarker` de MediaPipe. No dibuja
+nada y no clasifica gestos — todo eso vive en `gesture_recognition.py`.
 
 ```python
-open_camera(cam_idx)          # → cv2.VideoCapture (raises RuntimeError on failure)
-read_frame(cap)                # → (frame_bgr, mp_image) or (None, None) on EOF/error
-make_landmarker()              # → HandLandmarker context manager
-detect(landmarker, mp_image)   # → HandLandmarkerResult
+open_camera(cam_idx)    # → cv2.VideoCapture (lanza RuntimeError si falla)
+read_frame(cap)          # → (frame_bgr, mp_image) o (None, None) en EOF/error
+make_landmarker()        # → HandLandmarker como context manager
 ```
 
 ---
 
-## Track queue & persistence — `track_queue.py` + `tracklist.py`
+## Cola de pistas y persistencia — `track_queue.py` + `tracklist.py`
 
-`TrackQueue` (in-memory) is defined in its own module so both `state.py`
-and `tracklist.py` can import it without a circular dependency.
+`TrackQueue` (en memoria) está definida en su propio módulo para que tanto `state.py`
+como `tracklist.py` puedan importarla sin dependencia circular.
 
-`PersistentQueue` wraps it with automatic JSON persistence to
-`tracklist.json`, stored next to the script:
+`PersistentQueue` la envuelve con persistencia automática en JSON en `tracklist.json`,
+guardado junto al script:
 
 ```json
 [
@@ -360,77 +366,64 @@ and `tracklist.py` can import it without a circular dependency.
 ]
 ```
 
-Paths are stored relative to the directory containing `tracklist.json`, so
-the project stays portable when moved.
-
-```python
-from tracklist import PersistentQueue
-
-q = PersistentQueue()                                  # loads saved list automatically
-q.add("/abs/path/to/song.mp3", bpm=128.0, duration=214.5)
-q.remove(idx)
-q.snapshot()      # → (list_of_dicts, current_index)
-q.load_state()    # reload from disk (e.g. after external edit)
-```
-
-All `TrackQueue` methods still work — `PersistentQueue` subclasses it.
+Los paths se guardan relativos al directorio que contiene `tracklist.json`, para que
+el proyecto sea portátil al moverse.
 
 ---
 
 ## Dashboard — `ui.py`
 
-Dark rack-unit style Dear PyGui interface. Must run on the main thread.
+Interfaz Dear PyGui de estilo dark rack-unit. Debe correr en el hilo principal.
 
-**Panels:**
+**Paneles:**
 
-- **BPM Detection** — live BPM readout, ratio bar, debug row. The
-  `[AUDIO]` / `[TAP]` pills reflect `snap["bpm_source"]` live: whichever
-  source actually wrote `bpm_live` lights up, the other dims — paired with
-  the live `CFG.use_tempo_tapper` gating in `audio_analysis.py` /
-  `tempo_tapper.py`, so the pills show which source is actually in control,
-  not just whether the ratio is synced.
-- **Input Level** — waveform bars, RMS / peak meters.
-- **Backing Track** — transport controls, timeline scrubber, markers.
-- **Settings** — audio I/O, gain sliders, video device, hand command
-  mapper, pedal toggle, tempo-tapper toggle. Audio I/O, gain, camera index,
-  gesture map, pedal, and tempo-tapper settings all live in one collapsible
-  panel rather than being split across two.
-- **Time-Stretch** — reference BPM editor, buffer fill, smoothing α.
-- **Gesture Control** — live camera feed (flicker-free), hold bar.
-- **Track Queue** — scrollable list, inline BPM editor, reorder/load/remove,
-  persisted to `tracklist.json` automatically.
-- **System Log** — scrollable log drain.
-
-**Camera feed performance:** the feed no longer flashes —
-texture upload is rate-limited to a max of 30 fps via a frame counter,
-upload converts BGR→RGBA once into a pre-allocated buffer, and gesture-draw
-items are updated with `dpg.configure_item` instead of being deleted and
-redrawn every frame (eliminating the one-frame blank flash).
+- **Detección de BPM** — lectura de BPM en vivo, barra de ratio, fila de debug. Las
+  píldoras `[AUDIO]` / `[TAP]` reflejan `snap["bpm_source"]` en vivo.
+- **Nivel de entrada** — barras de forma de onda, medidores RMS/pico.
+- **Pista de fondo** — controles de transporte, scrubber de línea de tiempo, marcadores.
+- **Configuración** — E/S de audio, sliders de ganancia, dispositivo de video, mapeador
+  de comandos de gestos, toggles de pedal y tempo tapper.
+- **Time-Stretch** — editor de BPM de referencia, buffer fill, suavizado α.
+- **Control de gestos** — feed de cámara en vivo (sin parpadeo), barra de hold.
+- **Cola de pistas** — lista scrollable, editor de BPM inline, reordenar/cargar/quitar,
+  persistido automáticamente en `tracklist.json`.
+- **PEDAL SETUP** *(ventana emergente)* — indicadores en vivo de B1/B2/B3, umbral tap/hold,
+  timeout de seguridad, tabla de remapeo completa para los 14 nombres de eventos
+  (singles, pares y triple). Abre desde el header principal.
+- **Entrenar gestos** *(ventana emergente)* — flujo de grabación de clips para gestos personalizados.
+- **Log del sistema** — drain de log scrollable.
 
 ---
 
-## Logging — `logger.py`
+## Logger — `logger.py`
 
-Thread-safe ring-buffer logger with severity levels. Every pipeline
-component imports it; the UI drains it once per frame for the System Log
-panel.
-
----
-
-## Configuration — `config.py`
-
-Single source of truth for all user-adjustable settings, persisted to
-`config.json` next to the script. Every other module imports values from
-here rather than hard-coding them; the UI's Settings panel reads and writes
-this object directly.
+Logger thread-safe con ring buffer y niveles de severidad. Cada componente del pipeline
+lo importa; la UI lo vacía una vez por frame para el panel de Log del Sistema.
 
 ---
 
-## Shared buffers — `buffers.py`
+## Configuración — `config.py`
 
-Module-level singletons so `audio_input`, `audio_analysis`, and
-`audio_processing` all share the exact same ring buffer and queue objects
-without circular imports or argument passing:
+Fuente única de verdad para todos los ajustes del usuario, persistida en `config.json`
+junto al script. Cada otro módulo importa valores desde aquí en lugar de hardcodearlos;
+el panel de Configuración de la UI lee y escribe este objeto directamente.
+
+**Campos relevantes al pedal:**
+
+| Campo | Default | Descripción |
+|---|---|---|
+| `use_pedal` | `False` | Habilita/deshabilita el dispatch de comandos del pedal |
+| `pedal_map` | *(ver pedal.py)* | Dict `{event_name: command}` |
+| `pedal_hold_threshold_s` | `0.35` | Umbral tap vs. hold |
+| `pedal_stuck_timeout_s` | `5.0` | Timeout de seguridad para botones sin release |
+
+---
+
+## Buffers compartidos — `buffers.py`
+
+Singletons a nivel de módulo para que `audio_input`, `audio_analysis` y
+`audio_processing` compartan exactamente los mismos objetos de ring buffer y queue
+sin imports circulares ni paso de argumentos:
 
 ```python
 from buffers import audio_buffer, audio_queue
