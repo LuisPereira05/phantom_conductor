@@ -59,11 +59,7 @@ _DEFAULT_NUDGE_STEPS = 1
 _DEFAULT_HISTORY = 2
 _DEFAULT_GATE_FACTOR = 1.0  # fraction of a beat; 0.5 = 8th note
 
-# Catch-up (overshoot) — cuando el drift excede el gate de nudge normal,
-# en vez de descartarlo silenciosamente, se acumula como "deuda de fase"
-# y se paga corriendo más rápido que el target_rate por unos beats, en
-# vez de un salto de posición instantáneo (snap) o ignorarlo (nudge solo).
-_DEFAULT_CATCHUP_BEATS = 1  # en cuantos beats se intenta pagar la deuda
+_DEFAULT_CATCHUP_BEATS = 2  # en cuantos beats se intenta pagar la deuda
 _DEFAULT_CATCHUP_MAX_RATE_MULT = 2.0  # techo: rate_correction no pasa de 1.5x
 _DEFAULT_DEBT_EXIT_THRESHOLD_BEATS = (
     0.05  # deuda restante (en beats) para volver a modo nudge
@@ -88,10 +84,6 @@ class PhaseLock:
         # Hace cuantos beats fue aceptada la última variación (logging)
         self._beats_since_accept: int = 0
 
-        # Deuda de fase acumulada (segundos). Positivo = el grid va
-        # atrasado respecto al músico (el beat real llega ANTES de lo
-        # esperado, repetidamente) y hay que ACELERAR para alcanzarlo.
-        # Negativo = el grid va adelantado, hay que FRENAR.
         self._phase_debt: float = 0.0
         self._catching_up: bool = False
 

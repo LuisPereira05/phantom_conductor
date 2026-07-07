@@ -33,5 +33,12 @@
     "clips": 3,
     "frames": 558,
     "needs_retrain": false
+  },
+  {
+    "name": "FONE",
+    "command": "loop_next",
+    "clips": 3,
+    "frames": 650,
+    "needs_retrain": false
   }
 ]

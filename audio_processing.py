@@ -12,6 +12,7 @@ from buffers import (
     marker_buffers,
     marker_buffers_lock,
 )
+from config import CFG
 from logger import Logger
 from state import PhantomState
 
@@ -32,6 +33,93 @@ except ImportError:
 
 MIN_BPM = 60
 MAX_BPM = 200
+
+
+# ── MODO BAJO CONSUMO ────────────────────────────────────────────────────
+#
+# Pensado para PCs con menos poder de hardware, donde pyrubberband (que
+# invoca un binario externo por subproceso en cada bloque) puede tardar
+# más que la duración real del bloque y trabar el audio. Se activa con
+# un solo toggle: CFG.low_power_mode.
+
+
+def _rubberband_args() -> dict:
+    """
+    Argumentos extra para pyrubberband. En modo normal no se pasa nada
+    (mismo comportamiento de siempre: motor y crispness por defecto de
+    rubberband, que ya es el motor R2 "faster" al invocarse como
+    "rubberband"). En modo bajo consumo se fuerza explícitamente el motor
+    R2 y la crispness más baja (0 = --no-transients --no-lamination
+    --window-long) — la combinación más liviana que ofrece la librería,
+    a costa de algo de calidad sonora. Ver manual de rubberband-cli:
+    -2/--fast selecciona el motor R2; -c/--crisp 0-6 (default 4) solo
+    afecta al motor R2.
+
+    Nota: pyrubberband tiene un bug conocido (bmcfee/pyrubberband#21)
+    donde pasar `None` como valor de un flag sin argumento (p. ej.
+    "--fast") termina literalmente como el string "None" en la línea de
+    comandos, que rubberband rechaza. El fix documentado por la propia
+    librería es pasar '' (string vacío) en vez de None.
+    """
+    if not CFG.get("low_power_mode", False):
+        return {}
+    return {"--fast": "", "--crisp": "0"}
+
+
+def _beat_batch() -> int:
+    """
+    Cuántos beats se agrupan por llamada a pyrubberband. En modo normal,
+    1 (un beat por llamada, como siempre). En modo bajo consumo, varios
+    beats por llamada — cada invocación de pyrubberband dispara un
+    subproceso nuevo, así que agrupar reduce esa cantidad de
+    subprocesos por segundo (menos overhead), a costa de que un cambio
+    de BPM en vivo tarda un poco más en escucharse.
+    """
+    return 4 if CFG.get("low_power_mode", False) else 1
+
+
+def _lookahead_s() -> float:
+    """
+    Cuánto puede adelantarse el hilo de reproducción al reloj real antes
+    de tener que esperar. En modo normal, prácticamente nada (como
+    siempre: sincronizado casi al instante). En modo bajo consumo, un
+    colchón más grande — así una llamada a pyrubberband ocasionalmente
+    lenta no corta el audio, porque ya había bloques de sobra
+    encolados por delante.
+    """
+    return 1.5 if CFG.get("low_power_mode", False) else 0.15
+
+
+def _time_stretch(y: np.ndarray, rate: float, logger: Logger) -> np.ndarray:
+    """
+    Wrapper único para toda llamada a pyrubberband en este módulo, así
+    el modo bajo consumo se aplica de forma consistente en los dos
+    lugares que estiran audio (bloque de reproducción y buffers de
+    preview de marcadores) sin duplicar la lógica en cada uno.
+
+    Si los argumentos de modo bajo consumo fallan (p. ej. porque la
+    versión de rubberband instalada es más vieja y no reconoce --fast o
+    --crisp — la letra de la crispness varía entre versiones), se
+    reintenta una vez con los argumentos por defecto, para no quedarse
+    sin time-stretch por completo.
+    """
+    if not (HAS_PYRB and len(y) > 512 and abs(rate - 1.0) > 0.005):
+        return y
+    rbargs = _rubberband_args()
+    try:
+        return pyrb.time_stretch(y, SR, rate, rbargs=rbargs)
+    except Exception as e:
+        if rbargs:
+            logger.warn(
+                f"time-stretch (bajo consumo): {e} — reintentando sin esos flags"
+            )
+            try:
+                return pyrb.time_stretch(y, SR, rate)
+            except Exception as e2:
+                logger.warn(f"time-stretch: {e2}")
+                return y
+        logger.warn(f"time-stretch: {e}")
+        return y
 
 
 # LECTOR DE BPM TAG
@@ -236,39 +324,55 @@ def _consume_seek_request(state: PhantomState) -> float | None:
     return pos
 
 
-def _flush_audio_queue(logger: Logger, reason: str) -> int:
+def _consume_new_beats(
+    state: PhantomState,
+    pll,
+    bpm_live: float,
+    last_seen_beat: float | None,
+    logger: Logger,
+) -> float | None:
     """
-    Vacía audio_queue por completo (get_nowait hasta que quede vacía),
-    descartando cualquier bloque ya encolado pero todavía no reproducido.
+    Lee las detecciones de beat nuevas desde state.recent_beat_times
+    (poblado por el hilo de análisis en audio_analysis.py) y las
+    alimenta al PLL, una por una y en orden, vía pll.update().
 
-    Se llama justo ANTES de saltar al inicio de una sección de loop.
-    Sin esto, un bloque que ya estaba en la cola — encolado en la
-    iteración anterior, antes de detectar que se cruzó sec_end — seguiría
-    reproduciéndose después del salto, delante del buffer de preview del
-    marcador de inicio. Eso rompe el "salto instantáneo": en vez de oírse
-    el inicio de la sección de inmediato, se oye primero la cola de lo
-    que ya estaba encolado.
+    Este es el eslabón que faltaba: PhaseLock.update() es lo único que
+    mueve pll.rate_correction, y hasta ahora nada en este hilo lo
+    llamaba — el PLL se creaba y se reseteaba en los momentos
+    correctos, pero nunca recibía un solo beat, así que rate_correction
+    quedaba fijo en 1.0 para siempre (el bug de "recent_beat_times
+    nunca escrito", visto desde el lado del consumidor).
 
-    Trade-off a tener en cuenta: si la thread de audio output está
-    consumiendo la cola en el mismo instante en que esta hace el flush,
-    puede quedar momentáneamente sin datos (una ventana de silencio muy
-    breve) hasta que el put_nowait() del buffer de marcador la vuelva a
-    llenar. En la práctica esa ventana es del orden de un callback de
-    audio (unos pocos ms), pero es un costo real a cambio de eliminar la
-    repetición de contenido viejo.
+    `last_seen_beat` es el timestamp del último beat ya procesado (o
+    None si no se procesó ninguno desde el último reset del PLL — p.ej.
+    justo después de cargar una pista nueva o saltar de sección). Solo
+    se consumen beats estrictamente posteriores a ese valor, así no se
+    reprocesa el mismo beat dos veces si recent_beat_times conserva
+    historial entre llamadas.
 
-    Retorna cuántos bloques se descartaron (para logging).
+    Retorna el nuevo last_seen_beat para que el caller lo guarde y lo
+    pase de vuelta en la próxima iteración del loop.
+
+    Nota: asume que state.recent_beat_times es una lista/deque de
+    timestamps (time.time()), protegida por state._lock, igual que el
+    resto de PhantomState. Si el nombre o la forma real del atributo
+    difiere, este es el único lugar que hay que ajustar.
     """
-    discarded = 0
-    while True:
-        try:
-            audio_queue.get_nowait()
-            discarded += 1
-        except Exception:
-            break
-    if discarded:
-        logger.info(f"audio_queue flush: {discarded} bloque(s) descartado(s) ({reason})")
-    return discarded
+    with state._lock:
+        beats = list(getattr(state, "recent_beat_times", []))
+
+    if not beats:
+        return last_seen_beat
+
+    new_beats = [b for b in beats if last_seen_beat is None or b > last_seen_beat]
+    if not new_beats:
+        return last_seen_beat
+
+    new_beats.sort()
+    for bt in new_beats:
+        pll.update(bt, bpm_live)
+
+    return new_beats[-1]
 
 
 def _sync_marker_buffers(
@@ -321,14 +425,7 @@ def _sync_marker_buffers(
             if abs(entry["rate"] - rate) < 0.01:
                 continue
             raw = entry["raw"]
-            if HAS_PYRB and len(raw) > 512 and abs(rate - 1.0) > 0.005:
-                try:
-                    entry["stretched"] = pyrb.time_stretch(raw, SR, rate)
-                except Exception as e:
-                    logger.warn(f"marker preview stretch: {e}")
-                    entry["stretched"] = raw
-            else:
-                entry["stretched"] = raw
+            entry["stretched"] = _time_stretch(raw, rate, logger)
             entry["rate"] = rate
 
 
@@ -353,23 +450,11 @@ def _jump_to_position(
     vuelo, igual que cualquier bloque normal.
 
     Retorna (nuevo pos, nuevo t_next).
-
-    Siempre vacía audio_queue justo antes de encolar el contenido nuevo
-    (ver _flush_audio_queue). Esto vive ACÁ adentro, y no en cada call
-    site, a propósito: _jump_to_position es el único punto por el que
-    pasa cualquier salto (marcador manual vía pedal/UI, cambio de
-    sección de loop, wraparound automático de fin de sección, futura UI
-    "ir a"). Si el flush quedara afuera, cada nuevo tipo de salto que se
-    agregue en el futuro tendría que acordarse de llamarlo — y olvidarlo
-    reproduce exactamente el bug original: hasta un beat completo de
-    contenido viejo sonando antes del salto.
     """
     target_sample = max(0, min(int(seek_sec * SR), len(y_full)))
 
     with marker_buffers_lock:
         entry = marker_buffers.get(seek_sec)
-
-    _flush_audio_queue(logger, f"seek a {seek_sec:.2f}s")
 
     if entry is not None:
         try:
@@ -518,10 +603,6 @@ def backing_track_thread(state: PhantomState, logger: Logger):
         if active_section is not None:
             sec_start, sec_end = active_section
             if pos / SR >= sec_end:
-                # El flush de audio_queue ocurre adentro de
-                # _jump_to_position (ver docstring): cualquier bloque
-                # que ya estuviera encolado se descarta ahí mismo, justo
-                # antes de encolar el buffer de preview de sec_start.
                 pos, t_next = _jump_to_position(sec_start, y_full, logger)
                 state.set_position(pos / SR)
                 # el salto rompe la continuidad de fase que asume el PLL
@@ -560,13 +641,23 @@ def backing_track_thread(state: PhantomState, logger: Logger):
 
         safe_orig = max(1.0, bpm_orig)
         bpm_live = state.get_bpm() or safe_orig
+
+        # Alimentar al PLL con cualquier beat detectado desde la última
+        # iteración, ANTES de leer pll.rate_correction — si no, el rate
+        # de este bloque usaría una corrección desactualizada en un
+        # beat.
+        last_seen_beat = _consume_new_beats(
+            state, pll, bpm_live, last_seen_beat, logger
+        )
+
         rate = (bpm_live / safe_orig) * pll.rate_correction
 
         # Mantener listos los previews de marcadores a la velocidad actual
         _sync_marker_buffers(state, y_full, rate, logger)
 
-        # How many OUTPUT samples per beat?
-        out_beat_size = int(60.0 / max(1.0, bpm_live) * SR)
+        # How many OUTPUT samples per beat? (agrupando varios beats por
+        # llamada a pyrubberband en modo bajo consumo — ver _beat_batch)
+        out_beat_size = int(60.0 / max(1.0, bpm_live) * SR * _beat_batch())
 
         # How many INPUT samples needed to produce out_beat_size output?
         in_beat_size = int(out_beat_size * rate)
@@ -589,14 +680,15 @@ def backing_track_thread(state: PhantomState, logger: Logger):
         block = y_full[pos:end] * state.gain
 
         # Time-stretch this chunk
-        if HAS_PYRB and len(block) > 512 and abs(rate - 1.0) > 0.005:
-            try:
-                block = pyrb.time_stretch(block, SR, rate)
-            except Exception as e:
-                logger.warn(f"time-stretch: {e}")
+        block = _time_stretch(block, rate, logger)
 
-        # Wait and play
-        wait = t_next - time.time()
+        # Wait and play — se permite adelantar hasta _lookahead_s() al
+        # reloj real antes de frenar. En modo normal esto es ~0 (como
+        # siempre, sincronizado casi al instante); en modo bajo consumo
+        # deja acumular un colchón de bloques ya procesados, así una
+        # llamada a pyrubberband ocasionalmente lenta no corta el audio.
+        overshoot = t_next - time.time()
+        wait = overshoot - _lookahead_s()
         if wait > 0:
             time.sleep(wait)
         try:

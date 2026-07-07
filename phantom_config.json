@@ -1,7 +1,7 @@
 {
   "dev_in": 12,
   "dev_out": 12,
-  "input_gain": 1.3700000047683716,
+  "input_gain": 0.9900000095367432,
   "output_gain": 0.8500000238418579,
   "cam_index": 0,
   "gesture_map": {

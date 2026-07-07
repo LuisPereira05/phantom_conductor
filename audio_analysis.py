@@ -15,6 +15,11 @@ HOP_LENGTH = 256
 BANDPASS = (40, 8000)  # Filtro "high-pass" para exponer transientes m
 MIN_ONSET_GAP_S = 60.0 / CFG.max_bpm  # ou um valor fixo tipo 0.12s
 
+# Ventana usada para el gate de silencio — SOLO la cola más reciente del
+# buffer, no todo audio_buffer (que puede tener hasta BUFFER_SEC segundos
+# de historia). Ver nota larga en bpm_analysis_thread.
+SILENCE_GATE_WINDOW_S = 0.5
+
 
 #  DSP HELPERS
 def _butter_bandpass(lo: float, hi: float, fs: int, order: int = 4):
@@ -187,10 +192,32 @@ def bpm_analysis_thread(state: PhantomState, logger: Logger):
             y = np.array(audio_buffer, dtype=np.float32)
 
             # RMS gate — Umbral de silencio
-            rms = float(np.sqrt(np.mean(y**2)))
+            #
+            # OJO: audio_buffer es una ventana rotativa de hasta BUFFER_SEC
+            # (10s) segundos, no un clip aislado. Medir el RMS sobre TODA
+            # esa ventana hace que, apenas dejás de tocar, el gate tarde
+            # hasta ~10s en activarse — diluido por el audio fuerte de
+            # segundos atrás que todavía sigue dentro del buffer.
+            #
+            # Mientras tanto la ventana usada para estimar BPM (más abajo)
+            # sigue corriendo con esa mezcla de "silencio reciente" +
+            # "música vieja", y como los onsets reales se van espaciando
+            # cada vez más a medida que se acerca el silencio, la
+            # autocorrelación converge a un lag cada vez más largo — un
+            # BPM cada vez más bajo — durante varios segundos, hasta que
+            # el promedio de TODO el buffer finalmente cae por debajo del
+            # umbral. Por eso el BPM caía "de a poco" en vez de
+            # simplemente congelarse apenas se dejaba de tocar.
+            #
+            # El fix: medir el RMS solo de la cola más reciente del
+            # buffer (SILENCE_GATE_WINDOW_S ≈ 0.5s), que reacciona casi
+            # de inmediato en vez de esperar a que toda la ventana de
+            # 10s se "limpie".
+            recent_n = min(len(y), int(SR * SILENCE_GATE_WINDOW_S))
+            rms_recent = float(np.sqrt(np.mean(y[-recent_n:] ** 2)))
             rms_threshold = CFG.get("rms_threshold", 0.01)
-            if rms < rms_threshold:
-                # logger.debug(f"bpm-analysis: silent (rms={rms:.4f} < {rms_threshold})")
+            if rms_recent < rms_threshold:
+                # logger.debug(f"bpm-analysis: silent (rms={rms_recent:.4f} < {rms_threshold})")
                 with state._lock:
                     state.buffer_fill = min(1.0, len(audio_buffer) / (SR * 10))
                 continue
