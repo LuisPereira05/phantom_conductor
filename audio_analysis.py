@@ -13,6 +13,7 @@ from state import PhantomState
 # ── Constants --------------------------------------------------------------
 HOP_LENGTH = 256
 BANDPASS = (40, 8000)  # Filtro "high-pass" para exponer transientes m
+MIN_ONSET_GAP_S = 60.0 / CFG.max_bpm  # ou um valor fixo tipo 0.12s
 
 
 #  DSP HELPERS
@@ -61,6 +62,8 @@ def estimate_bpm(
     sr: int = SR,
     bpm_original: float | None = None,
     logger: Logger | None = None,
+    onset_wait_s: float | None = None,  # NOVO
+    onset_delta: float = 0.1,  # NOVO — era hardcoded/implícito antes
 ) -> tuple[float | None, dict]:
     """
     Estima el BPM de un buffer de audio
@@ -118,8 +121,18 @@ def estimate_bpm(
     # reutiliza la misma envolvente "onset" para no correr onset_strength
     # dos veces. units="frames" + frames_to_time evita perder precisión por
     # redondeo a milisegundos en cada paso.
+    wait_frames = max(
+        1, int(round((onset_wait_s or MIN_ONSET_GAP_S) * sr / HOP_LENGTH))
+    )
+    wait_frames = int(wait_frames)
+    delta = float(onset_delta)
     onset_frames = librosa.onset.onset_detect(
-        onset_envelope=onset, sr=sr, hop_length=HOP_LENGTH, units="frames"
+        onset_envelope=onset,
+        sr=sr,
+        hop_length=HOP_LENGTH,
+        units="frames",
+        wait=wait_frames,
+        delta=delta,
     )
     onset_frame_times = librosa.frames_to_time(
         onset_frames, sr=sr, hop_length=HOP_LENGTH
@@ -143,7 +156,7 @@ def estimate_bpm(
 
 
 def bpm_analysis_thread(state: PhantomState, logger: Logger):
-
+    print("STARTED BPM THREAD")
     last = 0.0
     tapper_was_active = False
 
@@ -187,6 +200,8 @@ def bpm_analysis_thread(state: PhantomState, logger: Logger):
                 y,
                 bpm_original=state.bpm_original,
                 logger=logger,
+                onset_wait_s=0.15,
+                onset_delta=0.405,
             )
 
             tapper_active = CFG.get("use_tempo_tapper", False)
@@ -236,7 +251,8 @@ def bpm_analysis_thread(state: PhantomState, logger: Logger):
                     onset_wall_time = window_start_wall + ft
                     if (
                         last_emitted_onset_wall_time is None
-                        or onset_wall_time > last_emitted_onset_wall_time
+                        or onset_wall_time - last_emitted_onset_wall_time
+                        >= MIN_ONSET_GAP_S
                     ):
                         state.recent_beat_times.append(onset_wall_time)
                         last_emitted_onset_wall_time = onset_wall_time

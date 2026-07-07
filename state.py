@@ -32,6 +32,7 @@ class PhantomState:
         self.track_duration: float = 0.0
         self.track_position: float = 0.0
 
+        self.seek_request: float | None = None
         self.markers: list[float] = []
         self.loop_section_index: int = -1
 
@@ -157,13 +158,38 @@ class PhantomState:
             self.stretch_ratio = (self.bpm_live / bpm) if self.bpm_live and bpm else 1.0
 
     # Marcadores y secciones de loop
+    def add_marker(self, position: float | None = None) -> float:
+        """
+        Añade un marcador en `position` (o en track_position si no se
+        especifica). Ignora duplicados dentro de un epsilon pequeño para
+        que pulsar el pedal dos veces por accidente en el mismo instante
+        no genere dos marcadores casi idénticos.
+        """
+        EPS = 0.05  # segundos
+        with self._lock:
+            pos = self.track_position if position is None else position
+            if any(abs(pos - m) < EPS for m in self.markers):
+                return pos
+            self.markers.append(pos)
+        return pos
+
+    def clear_markers(self):
+        """
+        Borra todos los marcadores de la pista actual. Si el loop estaba en
+        modo sección (loop_section_index >= 0), no queda ninguna sección
+        válida que apuntar, así que se resetea a -1 (pista completa) en
+        lugar de dejar un índice apuntando a nada. `is_looping` se deja
+        intacto: si el usuario quiere loop de pista completa, seguirá activo.
+        """
+        with self._lock:
+            self.markers.clear()
+            self.loop_section_index = -1
+
+    def request_seek(self, position: float):
+        with self._lock:
+            self.seek_request = position
+
     def get_loop_sections(self) -> list[tuple[float, float]]:
-        """
-        Retorna pares adyacentes ordenados de los marcadores, enmarcados
-        por 0 y la duración total.
-        Ej: marcadores [10, 30] en una pista de 60s → [(0,10), (10,30), (30,60)]
-        Retorna [] si no hay marcadores.
-        """
         with self._lock:
             pts = sorted(set(self.markers))
             dur = self.track_duration
@@ -173,10 +199,6 @@ class PhantomState:
         return [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
 
     def get_active_loop_section(self) -> tuple[float, float] | None:
-        """
-        Retorna (inicio, fin) de la sección de loop activa,
-        o None si loop_section_index es -1 (pista completa).
-        """
         sections = self.get_loop_sections()
         with self._lock:
             idx = self.loop_section_index
@@ -198,6 +220,7 @@ class PhantomState:
                 )
             sec = sections[self.loop_section_index]
             self.track_position = sec[0]
+            self.seek_request = sec[0]
 
     # Dispatcher de comandos
     def dispatch_command(self, cmd: str, logger=None) -> bool:
@@ -232,15 +255,16 @@ class PhantomState:
         elif cmd == "loop_toggle":
             with self._lock:
                 self.is_looping = not self.is_looping
-                if self.is_looping and self.markers and self.loop_section_index < 0:
-                    self.loop_section_index = 0
-                elif not self.is_looping:
+                if not self.is_looping:
                     self.loop_section_index = -1
+
         elif cmd in ("loop_next", "loop_prev"):
             delta = 1 if cmd == "loop_next" else -1
             with self._lock:
                 self.is_looping = True
             self.step_loop_section(delta)
+        elif cmd == "add_marker":
+            self.add_marker()
         else:
             return False
 

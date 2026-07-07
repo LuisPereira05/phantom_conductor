@@ -116,6 +116,7 @@ def _handle_line(
 def tempo_tapper_thread(
     state: PhantomState, logger: Logger, pedal: PedalController | None = None
 ):
+    print("STARTED TAPPER THREAD")
     """
     Same serial connection serves both the tempo tapper (BPM:/TAP:
     lines) and the foot pedal (B<n>p / B<n>r lines) — one Arduino, one

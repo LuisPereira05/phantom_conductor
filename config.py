@@ -51,9 +51,7 @@ class Config:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             with self._lock:
-                for k, v in saved.items():
-                    if k in self._data:
-                        self._data[k] = v
+                self._data.update(saved)
         except Exception as e:
             print(f"[config] carga fallida: {e}")
 

@@ -373,6 +373,7 @@ def _inference_thread(
 
 
 def gesture_vision_thread(cam_idx: int, state: PhantomState, logger: Logger):
+    print("STARTED VISION THREAD")
     # Orquestración del Pipeline, luego clasifica, dibuja el HUD y muestra la imagen en esta thread.
     download_model(logger)
 
@@ -518,25 +519,25 @@ def gesture_vision_thread(cam_idx: int, state: PhantomState, logger: Logger):
             hold_count = 0
             state.set_gesture("NO HAND", confidence=0.0, hold_frames=0, hands=0)
 
-        # _draw_hud(
-        #     frame,
-        #     raw_gesture,
-        #     is_custom,
-        #     fps,
-        #     state,
-        #     recording=TRAINER.is_clip_active(),
-        #     sample_count=TRAINER.frame_count(),
-        # )
+        _draw_hud(
+            frame,
+            raw_gesture,
+            is_custom,
+            fps,
+            state,
+            recording=TRAINER.is_clip_active(),
+            sample_count=TRAINER.frame_count(),
+        )
 
-        # cv2.imshow("Phantom Conductor", frame)
-        # key = cv2.waitKey(1) & 0xFF
-        # if key == ord("q"):
-        #     logger.warn("vision: quit by user (Q)")
-        #     state.stop()
-        #     break
-        # elif key == ord(" "):
-        #     new_state = state.toggle()
-        #     logger.info(f"space: {'PLAY' if new_state else 'PAUSE'}")
+        cv2.imshow("Phantom Conductor", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            logger.warn("vision: quit by user (Q)")
+            state.stop()
+            break
+        elif key == ord(" "):
+            new_state = state.toggle()
+            logger.info(f"space: {'PLAY' if new_state else 'PAUSE'}")
 
     cap.release()
     # cv2.destroyAllWindows()

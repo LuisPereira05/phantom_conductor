@@ -1,3 +1,4 @@
+import threading
 from collections import deque
 from queue import Queue
 
@@ -11,3 +12,10 @@ audio_buffer: deque = deque(maxlen=int(SR * BUFFER_SEC))
 
 # Bloques alineados
 audio_queue: Queue = Queue(maxsize=80)
+
+
+MARKER_BUFFER_SEC = 1.0
+
+marker_buffers_lock = threading.Lock()
+# marker_pos (float, segundos) -> {"raw": np.ndarray, "stretched": np.ndarray, "rate": float}
+marker_buffers: dict[float, dict] = {}

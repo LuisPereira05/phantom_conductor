@@ -69,13 +69,6 @@ def main():
         name="tempo-tapper",
     ).start()
 
-    threading.Thread(
-        target=tempo_tapper_thread,
-        args=(state, logger),
-        daemon=True,
-        name="tempo-tapper",
-    ).start()
-
     # Interfaz
     ui = PhantomUI(state, logger, pedal=pedal)
     try:

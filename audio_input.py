@@ -33,6 +33,7 @@ def make_audio_callback(state: PhantomState, logger: Logger):
 
 
 def input_thread(dev_in: int | None, state: PhantomState, logger: Logger):
+    print("STARTED INPUT THREAD")
     """
     Abre un InputStream en dev_in.
     Alimenta el audio_buffer a través de la llamada.
@@ -70,6 +71,7 @@ def input_thread(dev_in: int | None, state: PhantomState, logger: Logger):
 
 
 def playback_thread(dev_out: int | None, state: PhantomState, logger: Logger):
+    print("STARTED OUTPUT THREAD")
     """
     Abre un OutputStream en dev_out, vacía audio_queue en él.
     Se apaga cuando STATE.io_restart_requested o cuando STATE no está ejecutándose.
@@ -113,6 +115,7 @@ def playback_thread(dev_out: int | None, state: PhantomState, logger: Logger):
 
 
 def io_manager_thread(state: PhantomState, logger: Logger):
+    print("STARTED I/O THREAD")
     """
     Abre los Streams de audio (Entrada y Salida) usando los dispositivos por defecto.
     Cuando el usuario presiona "APPLY" en la interfaz, para los Streams actuales y abre los nuevos según la configuración.

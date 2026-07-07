@@ -32,28 +32,28 @@ from state import PhantomState
 #  PALETA DE COLORES
 
 C = {
-    "bg": (14, 14, 14, 255),
-    "panel": (22, 22, 22, 255),
-    "panel2": (28, 28, 28, 255),
-    "border": (42, 42, 42, 255),
-    "border2": (55, 55, 55, 255),
-    "text": (212, 207, 200, 255),
-    "text_dim": (110, 106, 98, 255),
-    "amber": (239, 159, 39, 255),
-    "amber_dim": (186, 117, 23, 255),
-    "amber_faint": (65, 36, 2, 255),
-    "green": (99, 197, 71, 255),
-    "green_dim": (59, 109, 17, 255),
-    "red": (226, 75, 74, 255),
-    "red_faint": (45, 16, 16, 255),
-    "blue": (55, 138, 221, 255),
-    "blue_dim": (24, 95, 165, 255),
-    "cyan": (50, 210, 210, 255),
-    "select": (35, 55, 90, 255),
+    "bg": (245, 245, 243, 255),
+    "panel": (255, 255, 255, 255),
+    "panel2": (250, 250, 248, 255),
+    "border": (220, 220, 215, 255),
+    "border2": (200, 200, 195, 255),
+    "text": (30, 30, 30, 255),
+    "text_dim": (130, 130, 125, 255),
+    "amber": (210, 130, 20, 255),
+    "amber_dim": (170, 100, 15, 255),
+    "amber_faint": (255, 240, 210, 255),
+    "green": (50, 160, 50, 255),
+    "green_dim": (35, 120, 35, 255),
+    "red": (200, 55, 55, 255),
+    "red_faint": (255, 230, 230, 255),
+    "blue": (45, 110, 200, 255),
+    "blue_dim": (30, 80, 160, 255),
+    "cyan": (30, 170, 170, 255),
+    "select": (210, 230, 255, 255),
     "white": (255, 255, 255, 255),
 }
 
-GESTURE_ICONS = {"NO HAND": " — ", "PLAY": "[O]", "PAUSE": "[F]"}
+GESTURE_ICONS = {"NO HAND": " - ", "PLAY": "[O]", "PAUSE": "[F]"}
 
 CAM_W, CAM_H = 640, 480
 _BLANK_TEXTURE = [0.0] * (CAM_W * CAM_H * 4)
@@ -158,6 +158,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
     # ── punto de entrada ──────────────────────────────────────────────────────
     def setup(self):
         dpg.create_context()
+        print("STARTED UI THREAD")
 
         with dpg.texture_registry():
             dpg.add_dynamic_texture(
@@ -327,7 +328,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
             # =========================
             with dpg.child_window(
                 tag="fixed_header",
-                height=360,
+                height=475,
                 border=False,
                 no_scrollbar=True,
             ):
@@ -362,7 +363,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
             # =========================
             with dpg.child_window(
                 tag="scroll_body",
-                height=-134,
+                height=300,
                 border=False,
                 horizontal_scrollbar=False,
             ):
@@ -430,7 +431,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
             dpg.add_spacer(height=2)
             with dpg.group(horizontal=True):
                 with dpg.group():
-                    with dpg.drawlist(width=120, height=56, tag="bpm_draw"):
+                    with dpg.drawlist(width=140, height=56, tag="bpm_draw"):
                         dpg.draw_text(
                             (0, 0),
                             "---",
@@ -505,7 +506,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
                         "sin archivo cargado", tag="file_name", color=C["amber"]
                     )
                     dpg.add_spacer(width=10)
-                    dpg.add_text("—", tag="file_meta", color=C["text_dim"])
+                    dpg.add_text("", tag="file_meta", color=C["text_dim"])
                 dpg.add_spacer(height=4)
                 with dpg.drawlist(width=688, height=20, tag="timeline_draw"):
                     dpg.draw_rectangle(
@@ -837,7 +838,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
                 with dpg.group():
                     dpg.add_text("[ ]", tag="gest_icon", color=C["text_dim"])
                     dpg.add_text("SIN MANO", tag="gest_name", color=C["text_dim"])
-                    dpg.add_text("—", tag="gest_conf", color=C["text_dim"])
+                    dpg.add_text("-", tag="gest_conf", color=C["text_dim"])
                 dpg.add_spacer(width=10)
                 with dpg.group():
                     dpg.add_text("HOLD", color=C["text_dim"])
@@ -858,7 +859,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
                             "DESCONECTADA", tag="cam_state", color=C["text_dim"]
                         )
                     dpg.add_text("MANOS: 0", tag="cam_hands", color=C["text"])
-                    dpg.add_text("CMD:   —", tag="cam_lastcmd", color=C["text"])
+                    dpg.add_text("CMD:   -", tag="cam_lastcmd", color=C["text"])
                     dpg.add_spacer(height=4)
                     dpg.add_text("Mano abierta = REPRODUCIR", color=C["green"])
                     dpg.add_text("Puño         = PAUSAR", color=C["blue"])
@@ -879,29 +880,32 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
             dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
                 dpg.add_button(
-                    label=" + AGREGAR ",
+                    label=" AGREGAR ",
                     tag="btn_add",
                     callback=lambda: dpg.show_item("file_dlg"),
                     width=80,
                 )
                 dpg.bind_item_theme("btn_add", self._th_grn)
                 dpg.add_button(
-                    label=" ▲ ", tag="btn_q_up", callback=self._cb_q_up, width=36
+                    label="subir", tag="btn_q_up", callback=self._cb_q_up, width=36
                 )
                 dpg.bind_item_theme("btn_q_up", self._th_dim)
                 dpg.add_button(
-                    label=" ▼ ", tag="btn_q_down", callback=self._cb_q_down, width=36
+                    label="bajar",
+                    tag="btn_q_down",
+                    callback=self._cb_q_down,
+                    width=36,
                 )
                 dpg.bind_item_theme("btn_q_down", self._th_dim)
                 dpg.add_button(
-                    label=" ▶ CARGAR ",
+                    label=" CARGAR ",
                     tag="btn_q_load",
                     callback=self._cb_q_load,
                     width=84,
                 )
                 dpg.bind_item_theme("btn_q_load", self._th_amb)
                 dpg.add_button(
-                    label=" ✕ QUITAR ",
+                    label=" QUITAR ",
                     tag="btn_q_rem",
                     callback=self._cb_q_remove,
                     width=76,
@@ -916,7 +920,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
                 dpg.bind_item_theme("btn_q_clear", self._th_red)
                 dpg.add_spacer(width=8)
                 dpg.add_text(
-                    "💾 guardado automático",
+                    "guardado automático",
                     tag="queue_save_indicator",
                     color=C["text_dim"],
                 )
@@ -958,7 +962,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
                 border=False,
                 horizontal_scrollbar=False,
             ):
-                dpg.add_text("— vacío —", tag="queue_empty_label", color=C["text_dim"])
+                dpg.add_text(" vacío ", tag="queue_empty_label", color=C["text_dim"])
 
     # ── log ───────────────────────────────────────────────────────────────────
     def _build_log_panel(self):
@@ -1128,7 +1132,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
     def _cb_use_tapper(self, sender, app_data, user_data):
         CFG.set("use_tempo_tapper", app_data)
         self.logger.info(
-            f"tempo tapper: {'ACTIVADO — escritura de BPM de audio pausada' if app_data else 'DESACTIVADO — BPM de audio reanudado'}"
+            f"tempo tapper: {'ACTIVADO - escritura de BPM de audio pausada' if app_data else 'DESACTIVADO - BPM de audio reanudado'}"
         )
 
     def _cb_set_ref_bpm(self):
@@ -1234,7 +1238,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
                 dpg.configure_item("io_led", color=C["text_dim"])
                 dpg.set_value(
                     "io_status",
-                    "sin iniciar — selecciona dispositivos y haz clic en APLICAR",
+                    "sin iniciar - selecciona dispositivos y haz clic en APLICAR",
                 )
 
     def _update_clock(self, snap):
@@ -1440,7 +1444,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
             dpg.configure_item("gest_name", default_value=name, color=gcol)
             dpg.configure_item(
                 "gest_conf",
-                default_value=f"{conf:.0%}" if active else "—",
+                default_value=f"{conf:.0%}" if active else "-",
                 color=C["text_dim"],
             )
             self._last_gesture = name
@@ -1452,7 +1456,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
         dpg.set_value("cam_state", "ACTIVA" if active else "EN ESPERA")
         dpg.configure_item("cam_state", color=C["green"] if active else C["text_dim"])
         dpg.set_value("cam_hands", f"MANOS: {hands}")
-        dpg.set_value("cam_lastcmd", f"CMD:   {cmd}" if cmd else "CMD:   —")
+        dpg.set_value("cam_lastcmd", f"CMD:   {cmd}" if cmd else "CMD:   -")
         dpg.configure_item("cam_lastcmd", color=C["green"] if cmd else C["text"])
 
     def _update_queue_panel(self):
@@ -1467,9 +1471,7 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
         try:
             dpg.set_value(
                 "q_bpm_hint",
-                ""
-                if self._queue_sel >= 0
-                else "← selecciona una fila y luego FIJAR BPM",
+                "" if self._queue_sel >= 0 else "selecciona una fila y luego FIJAR BPM",
             )
         except Exception:
             pass
@@ -1518,11 +1520,11 @@ class PhantomUI(GestureTrainUI, PedalSetupUI):
                 bpm = t.get("bpm")
                 bpm_str = f"{bpm:.0f}" if bpm is not None else "??"
                 dur = t.get("duration", 0.0)
-                dur_str = f"{int(dur) // 60}:{int(dur) % 60:02d}" if dur else "—"
+                dur_str = f"{int(dur) // 60}:{int(dur) % 60:02d}" if dur else "-"
                 row_col = (
                     C["amber"] if is_cur else C["white"] if is_sel else C["text_dim"]
                 )
-                prefix = "▶" if is_cur else f"{i + 1}"
+                prefix = "->" if is_cur else f"{i + 1}"
 
                 with dpg.table_row():
                     dpg.add_text(prefix, color=row_col)

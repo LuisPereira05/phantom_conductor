@@ -22,6 +22,7 @@ _ALL_CMDS = [
     "loop_next",
     "loop_prev",
     "none",
+    "add_marker",
 ]
 
 _C = {
